@@ -1,0 +1,46 @@
+name: March7th Cloud Run
+
+on:
+  schedule:
+    # 每天 4:00 UTC = 12:00 北京时间
+    - cron: '0 4 * * *'
+  workflow_dispatch:  # 手动触发
+  repository_dispatch:
+    types: [march7th-trigger]
+
+jobs:
+  march7th:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/moesnow/march7thassistant:latest
+      options: --shm-size=1g
+
+    steps:
+      - name: Checkout files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            config.yaml
+            3rdparty
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare config
+        run: |
+          ls -la
+          cat config.yaml || echo "No config.yaml found"
+
+      - name: Run March7th Assistant
+        run: |
+          echo "Starting March7th Assistant..."
+          # 容器内直接运行 main 任务
+          cd /m7a
+          python main.py --task main || true
+
+      - name: Upload updated profile
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "Update browser profile $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
