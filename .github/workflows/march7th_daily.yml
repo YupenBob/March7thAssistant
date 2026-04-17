@@ -8,6 +8,9 @@ on:
   repository_dispatch:
     types: [march7th-trigger]
 
+permissions:
+  contents: write
+
 jobs:
   march7th:
     runs-on: ubuntu-latest
@@ -24,6 +27,7 @@ jobs:
             config.yaml
             3rdparty
           sparse-checkout-cone-mode: false
+          persist-credentials: true
 
       - name: Prepare config
         run: |
@@ -33,7 +37,6 @@ jobs:
       - name: Run March7th Assistant
         run: |
           echo "Starting March7th Assistant..."
-          # 容器内直接运行 main 任务
           cd /m7a
           python main.py --task main || true
 
@@ -41,6 +44,7 @@ jobs:
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git status
           git add -A
           git diff --staged --quiet || git commit -m "Update browser profile $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push
+          git push origin main
