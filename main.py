@@ -43,6 +43,16 @@ def parse_args():
         action='store_true',
         help='列出所有可用的任务'
     )
+    optional.add_argument(
+        '--workflow-name',
+        metavar='NAME',
+        help='按名称运行流程'
+    )
+    optional.add_argument(
+        '--workflow-step-path',
+        metavar='PATH',
+        help='仅执行指定步骤路径，例如 0/1/2'
+    )
 
     args = parser.parse_args()
 
@@ -57,6 +67,12 @@ def parse_args():
         print("  启动并执行完整运行:     March7th Assistant.exe main")
         print("  执行每日实训:           March7th Assistant.exe daily")
         sys.exit(0)
+
+    if args.task and args.workflow_name:
+        parser.error('不能同时指定 TASK 和 --workflow-name')
+
+    if args.workflow_step_path and not args.workflow_name:
+        parser.error('--workflow-step-path 需要配合 --workflow-name 使用')
 
     return args
 
@@ -81,9 +97,11 @@ from module.logger import log
 from module.notification import notif
 from module.notification.notification import NotificationLevel
 from module.ocr import ocr
+from module.workflow import WorkflowRunner, load_workflow_execution_payload
 from utils.screenshot_util import save_error_screenshot
 
 import tasks.game as game
+from module.game import cloud_game
 import tasks.reward as reward
 import tasks.challenge as challenge
 import tasks.version as version
@@ -119,7 +137,6 @@ def run_main_actions(no_run_immediately=False):
             notif.start_batch()
         version.start()
         game.start()
-        reward.start_specific("dispatch")
         Daily.start()
         reward.start()
         game.stop(True)
@@ -129,6 +146,9 @@ def run_sub_task(action):
     if action != "currencywarstemp" and action != "divergenttemp":
         game.start()
     else:
+        if cfg.cloud_game_enable:
+            if not cloud_game.start_game_process():
+                raise Exception("启动或连接浏览器失败")
         game.switch_to_game()
 
     def currencywars(mode=None):
@@ -152,6 +172,7 @@ def run_sub_task(action):
             universe.start()
 
     sub_tasks = {
+        "routine": Daily.routine,
         "daily": lambda: (Daily.run(), reward.start()),
         "power": Power.run,
         "currencywars": lambda: currencywars(),
@@ -203,15 +224,27 @@ def run_notify_action():
     sys.exit(0)
 
 
-def main(action=None, no_run_immediately=False):
+def run_workflow_action(workflow_name: str, workflow_step_path=None):
+    workflow = load_workflow_execution_payload(workflow_name, workflow_step_path)
+    runner = WorkflowRunner(
+        log_callback=lambda message: print(message, flush=True),
+        mirror_to_project_log=False,
+    )
+    return runner.run(workflow)
+
+
+def main(action=None, no_run_immediately=False, workflow_name=None, workflow_step_path=None):
     first_run()
+
+    if workflow_name:
+        return run_workflow_action(workflow_name, workflow_step_path)
 
     # 完整运行
     if action is None or action == "main":
         run_main_actions(no_run_immediately)
 
     # 子任务
-    elif action in ["daily", "power", "currencywars", "currencywarsloop", "currencywarstemp", "divergent", "divergentloop", "divergenttemp", "fight", "universe", "forgottenhall", "purefiction", "apocalyptic", "redemption"]:
+    elif action in ["routine", "daily", "power", "currencywars", "currencywarsloop", "currencywarstemp", "divergent", "divergentloop", "divergenttemp", "fight", "universe", "forgottenhall", "purefiction", "apocalyptic", "redemption"]:
         run_sub_task(action)
 
     # 子任务 原生图形界面
@@ -242,17 +275,31 @@ def main(action=None, no_run_immediately=False):
 
 # 程序结束时的处理器
 def exit_handler():
-    """注册程序退出时的处理函数，用于清理OCR资源."""
+    """注册程序退出时的处理函数，用于清理OCR和调试资源."""
     ocr.exit_ocr()
+    # 清理调试叠加层
+    try:
+        from module.automation import auto
+        auto.shutdown_debug()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         atexit.register(exit_handler)
-        if args.task:
-            main(action=args.task, no_run_immediately=args.no_run_immediately)
+        if args.workflow_name:
+            result = main(
+                no_run_immediately=args.no_run_immediately,
+                workflow_name=args.workflow_name,
+                workflow_step_path=args.workflow_step_path,
+            )
+        elif args.task:
+            result = main(action=args.task, no_run_immediately=args.no_run_immediately)
         else:
-            main(no_run_immediately=args.no_run_immediately)
+            result = main(no_run_immediately=args.no_run_immediately)
+        if result is False:
+            sys.exit(1)
     except KeyboardInterrupt:
         log.error("发生错误: 手动强制停止")
         pause_on_error()

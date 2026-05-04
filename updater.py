@@ -19,8 +19,9 @@ from module.update.download_proxy import get_update_download_aria2_args, get_upd
 class Updater:
     """应用程序更新器，负责检查、下载、解压和安装最新版本的应用程序。"""
 
-    def __init__(self, logger: Logger, download_url=None, file_name=None):
+    def __init__(self, logger: Logger, download_url=None, file_name=None, auto_mode=False):
         self.logger = logger
+        self.auto_mode = auto_mode
         self.process_names = ["March7th Assistant.exe", "March7th Launcher.exe", "flet.exe", "gui.exe", "Fhoe-Rail.exe", "chromedriver.exe", "PaddleOCR-json.exe"]
         self.api_urls = [
             "https://api.github.com/repos/moesnow/March7thAssistant/releases/latest",
@@ -37,9 +38,14 @@ class Updater:
         self.logger.hr("获取下载链接", 0)
         if download_url is None:
             self.download_url = self.get_download_url()
+            if self.auto_mode and not self.download_url:
+                self.logger.info("当前已是最新版本，自动退出更新流程")
+                self.logger.hr("完成", 2)
+                sys.exit(0)
             self.logger.info(f"下载链接: {green(self.download_url)}")
             self.logger.hr("完成", 2)
-            input("按回车键开始更新")
+            if not self.auto_mode:
+                input("按回车键开始更新")
         else:
             self.logger.info(f"下载链接: {green(self.download_url)}")
             self.logger.hr("完成", 2)
@@ -73,7 +79,9 @@ class Updater:
         if download_url is None:
             raise Exception("没有找到合适的下载URL")
 
-        self.compare_versions(version)
+        has_update = self.compare_versions(version)
+        if self.auto_mode and not has_update:
+            return None
         return download_url
 
     def compare_versions(self, version):
@@ -83,13 +91,16 @@ class Updater:
                 current_version = file.read().strip()
             if parse(version.lstrip('v')) > parse(current_version.lstrip('v')):
                 self.logger.info(f"发现新版本: {current_version} ——> {version}")
+                return True
             else:
                 self.logger.info(f"本地版本: {current_version}")
                 self.logger.info(f"远程版本: {version}")
                 self.logger.info(f"当前已是最新版本")
+                return False
         except Exception as e:
             self.logger.info(f"本地版本获取失败: {e}")
             self.logger.info(f"最新版本: {version}")
+            return True
 
     def find_fastest_mirror(self, mirror_urls, timeout=5):
         """测速并找到最快的镜像。"""
@@ -386,6 +397,7 @@ class Updater:
         """覆盖安装最新版本的文件。"""
         self.logger.hr("覆盖", 0)
         while True:
+            self.logger.info("检查是否有文件被占用...")
             files_to_overwrite = self.get_files_to_overwrite()
             locked = self.check_target_files_locked(files_to_overwrite)
             if locked:
@@ -397,6 +409,8 @@ class Updater:
                     self.logger.info(red(f"...另外 {remaining} 个文件被占用（未显示）"))
                 input("请手动关闭相关进程后按回车重新检测...")
                 continue
+            else:
+                self.logger.info("没有文件被占用，准备覆盖...")
 
             try:
                 self.logger.info("开始覆盖...")
@@ -569,10 +583,16 @@ def check_temp_dir_and_run():
     #     subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS)
     #     sys.exit(0)
 
-    download_url = sys.argv[1] if len(sys.argv) == 3 else None
-    file_name = sys.argv[2] if len(sys.argv) == 3 else None
+    args = sys.argv[1:]
+    auto_mode = False
+    if args and args[0] in ("--auto", "-a", "/auto"):
+        auto_mode = True
+        args = args[1:]
+
+    download_url = args[0] if len(args) == 2 else None
+    file_name = args[1] if len(args) == 2 else None
     logger = Logger()
-    updater = Updater(logger, download_url, file_name)
+    updater = Updater(logger, download_url, file_name, auto_mode=auto_mode)
     updater.run()
 
 

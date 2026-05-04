@@ -1,11 +1,13 @@
+import os
+import sys
+
+import markdown
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QStackedWidget, QSpacerItem, QScroller, QScrollerProperties
 from qfluentwidgets import qconfig, ScrollArea, Pivot
 from .common.style_sheet import StyleSheet
 from module.localization import tr
-import markdown
-import sys
 
 
 class HelpInterface(ScrollArea):
@@ -19,6 +21,7 @@ class HelpInterface(ScrollArea):
 
         self.helpLabel = QLabel(tr("帮助"), self)
         self.tutorialLabel = QLabel(parent)
+        self.workflowLabel = QLabel(parent)
         self.faqLabel = QLabel(parent)
         self.tasksLabel = QLabel(parent)
         self.changelogLabel = QLabel(parent)
@@ -67,23 +70,12 @@ th, td {
 }
 </style>
 """
-        # Load Tutorial based on language setting
         from module.config import cfg
-        tutorial_file = "./assets/docs/Tutorial.md"
-        if hasattr(cfg, 'ui_language_now'):
-            if cfg.ui_language_now == "ko_KR":
-                import os
-                ko_file = "./assets/docs/Tutorial_ko.md"
-                if os.path.exists(ko_file):
-                    tutorial_file = ko_file
-            elif cfg.ui_language_now == "en_US":
-                import os
-                en_file = "./assets/docs/Tutorial_en.md"
-                if os.path.exists(en_file):
-                    tutorial_file = en_file
+        tutorial_file = self._get_localized_doc_path("Tutorial")
         try:
             with open(tutorial_file, 'r', encoding='utf-8') as file:
-                self.content = file.read().replace('/assets/docs/Background.md', 'https://m7a.top/#/assets/docs/Background').replace('/assets/docs/Docker.md', 'https://m7a.top/#/assets/docs/Docker')
+                self.content = file.read().replace('/assets/docs/Background.md', 'https://m7a.top/#/assets/docs/Background').replace('/assets/docs/Docker.md',
+                                                                                                                                     'https://m7a.top/#/assets/docs/Docker').replace('/assets/docs/Workflow.md', 'https://m7a.top/#/assets/docs/Workflow')
                 self.content = '\n'.join(self.content.split('\n')[1:])
         except FileNotFoundError:
             sys.exit(1)
@@ -96,6 +88,21 @@ th, td {
         self.tutorialLabel.setOpenExternalLinks(True)
         self.tutorialLabel.linkActivated.connect(self.open_url)
 
+        workflow_file = self._get_localized_doc_path("Workflow")
+        try:
+            with open(workflow_file, 'r', encoding='utf-8') as file:
+                self.content = file.read()
+        except FileNotFoundError:
+            sys.exit(1)
+        self.workflow_content = tutorial_style + markdown.markdown(self.content, extensions=['tables']).replace('<h2>', '<br><h2>').replace('</h2>', '</h2><hr>').replace('<br>', '', 1) + '<br>'
+
+        if qconfig.theme.name == "DARK":
+            self.workflowLabel.setText(self.workflow_content.replace("border: 1px solid black;", "border: 1px solid white;"))
+        else:
+            self.workflowLabel.setText(self.workflow_content)
+        self.workflowLabel.setOpenExternalLinks(True)
+        self.workflowLabel.linkActivated.connect(self.open_url)
+
         faq_style = """
 <style>
 a {
@@ -104,19 +111,7 @@ a {
 }
 </style>
 """
-        # Load FAQ based on language setting
-        faq_file = "./assets/docs/FAQ.md"
-        if hasattr(cfg, 'ui_language_now'):
-            if cfg.ui_language_now == "ko_KR":
-                import os
-                ko_faq_file = "./assets/docs/FAQ_ko.md"
-                if os.path.exists(ko_faq_file):
-                    faq_file = ko_faq_file
-            elif cfg.ui_language_now == "en_US":
-                import os
-                en_faq_file = "./assets/docs/FAQ_en.md"
-                if os.path.exists(en_faq_file):
-                    faq_file = en_faq_file
+        faq_file = self._get_localized_doc_path("FAQ")
         try:
             with open(faq_file, 'r', encoding='utf-8') as file:
                 self.content = file.read()
@@ -145,7 +140,42 @@ th, td {
 </style>
 """
         # Daily training tasks table - language based
-        if hasattr(cfg, 'ui_language_now') and cfg.ui_language_now == "ko_KR":
+        if hasattr(cfg, 'ui_language_now') and cfg.ui_language_now == "ja_JP":
+            self.content = """
+| タスク内容 | 活躍度 | 対応状況 |
+| ----------------------------------- | -------- | -------- |
+| ゲームにログイン |   +100   |   ✅     |
+| 委託を1回実行または報酬を1回受け取る |   +100   |   ✅     |
+| 開拓力を累計120消費 |   +200   |   ✅     |
+| 敵を累計20体倒す |   +100   |   ✅     |
+| サポートキャラを使用して戦闘に1回勝利 |   +200   |   ✅     |
+| 「万能合成機」を1回使用 |   +100   |   ✅    |
+| 任意の遺物を1回強化 |   +100   |   ❌    |
+| 「差分宇宙」または「貨幣戦争」を1回完了 |   +500   |   ✅    |
+| デイリー任務を1個完了 |   +200  |   削除済み  |
+| 写真を1回撮る |   +100   |   削除済み  |
+| 「疑似花萼（金）」を1回完了 |   +100  |   削除済み  |
+| 「疑似花萼（赤）」を1回完了 |   +100  |   削除済み  |
+| 「凝滞虚影」を1回完了 |   +100  |   削除済み  |
+| 「侵蝕トンネル」を1回完了 |   +100  |   削除済み  |
+| 「歴戦余韻」を1回完了 |   +200  |   削除済み  |
+| 「忘却の庭」を1回完了 |   +200  |   削除済み  |
+| 「模擬宇宙」（任意世界）の1エリアをクリア |   +200  |   削除済み  |
+| 「模擬宇宙」を1回完了 |   +500  |   削除済み  |
+| 弱点撃破効果を累計5回発動 |   +100  |   削除済み  |
+| 1回の戦闘で3種類の属性弱点撃破を発動 |   +100  |   削除済み  |
+| 秘技を累計2回使用 |   +100  |   削除済み  |
+| 弱点で戦闘に入り3回勝利 |   +100  |   削除済み  |
+| 破壊可能オブジェクトを累計3個破壊 |   +200  |   削除済み  |
+| 必殺技でとどめを1回刺す |   +200  |   削除済み  |
+| 任意のキャラを1回レベルアップ |   +100  |   削除済み  |
+| 任意の光円錐を1回レベルアップ |   +100  |   削除済み  |
+| 任意の遺物を1個分解 |   +100  |   削除済み  |
+| 消耗品を1回合成 |   +100  |   削除済み  |
+| 素材を1回合成 |   +100  |   削除済み  |
+| 消耗品を1個使用 |   +100  |   削除済み  |
+        """
+        elif hasattr(cfg, 'ui_language_now') and cfg.ui_language_now == "ko_KR":
             self.content = """
 | 작업 설명                             | 활성도 | 지원 상태 |
 | ----------------------------------- | -------- | -------- |
@@ -265,19 +295,7 @@ a {
 }
 </style>
 """
-        # Load Changelog based on language setting
-        changelog_file = "./assets/docs/Changelog.md"
-        if hasattr(cfg, 'ui_language_now'):
-            if cfg.ui_language_now == "ko_KR":
-                import os
-                ko_changelog_file = "./assets/docs/Changelog_ko.md"
-                if os.path.exists(ko_changelog_file):
-                    changelog_file = ko_changelog_file
-            elif cfg.ui_language_now == "en_US":
-                import os
-                en_changelog_file = "./assets/docs/Changelog_en.md"
-                if os.path.exists(en_changelog_file):
-                    changelog_file = en_changelog_file
+        changelog_file = self._get_localized_doc_path("Changelog")
         try:
             with open(changelog_file, 'r', encoding='utf-8') as file:
                 self.content = file.read()
@@ -298,6 +316,7 @@ a {
 
         # self.vBoxLayout.addWidget(self.tutorialLabel, 0, Qt.AlignTop)
         self.addSubInterface(self.tutorialLabel, 'tutorialLabel', tr('使用教程'))
+        self.addSubInterface(self.workflowLabel, 'workflowLabel', tr('流程编排'))
         self.addSubInterface(self.faqLabel, 'faqLabel', tr('常见问题'))
         self.addSubInterface(self.tasksLabel, 'tasksLabel', tr('每日实训'))
         self.addSubInterface(self.changelogLabel, 'changelogLabel', tr('更新日志'))
@@ -335,11 +354,31 @@ a {
     def open_url(self, url):
         QDesktopServices.openUrl(QUrl(url))
 
+    def _get_localized_doc_path(self, base_name: str) -> str:
+        from module.config import cfg
+
+        language_suffix_map = {
+            "ja_JP": "ja",
+            "ko_KR": "ko",
+            "en_US": "en",
+        }
+        suffix = language_suffix_map.get(getattr(cfg, 'ui_language_now', ''), '')
+        if suffix:
+            localized_path = f"./assets/docs/{base_name}_{suffix}.md"
+            if os.path.exists(localized_path):
+                return localized_path
+        return f"./assets/docs/{base_name}.md"
+
     def __themeChanged(self):
         if qconfig.theme.name == "DARK":
             self.tutorialLabel.setText(self.tutorial_content.replace("border: 1px solid black;", "border: 1px solid white;"))
         else:
             self.tutorialLabel.setText(self.tutorial_content)
+
+        if qconfig.theme.name == "DARK":
+            self.workflowLabel.setText(self.workflow_content.replace("border: 1px solid black;", "border: 1px solid white;"))
+        else:
+            self.workflowLabel.setText(self.workflow_content)
 
         if qconfig.theme.name == "DARK":
             self.tasksLabel.setText(self.tasks_content.replace("border: 1px solid black;", "border: 1px solid white;"))
