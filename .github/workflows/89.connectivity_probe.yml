@@ -62,46 +62,55 @@ jobs:
           probe "sr-cloud"      "https://sr.mihoyo.com/cloud/"
           probe "user-passport" "https://user.mihoyo.com/"
           probe "webapi-account" "https://webapi.account.mihoyo.com/"
+          # 页面里 preconnect 的云游戏后端 + 静态资源域
+          probe "api-cloudgame"  "https://api-cloudgame.mihoyo.com/"
+          probe "webstatic-clgm" "https://webstatic.mihoyo.com/common/clgm-web-app/sr/comp/main.4.6.0.js"
           echo
 
-      - name: Verify expected DOM hooks exist in the page
+      - name: Verify page structure
         run: |
           set -uo pipefail
           BODY="/tmp/p_sr-cloud.bin"
           {
-            echo "## 🔍 关键 DOM 锚点（代码里硬依赖的 selector）"
+            echo "## 🔍 页面结构判定"
             echo
-            echo "| 锚点 | 代码位置 | 是否出现 |"
-            echo "|---|---|---|"
+            echo "**重要纠正**：云游戏站点是 Vue SPA，登录 iframe / 游戏画布都由 JS"
+            echo "运行时注入，**不会**出现在静态 HTML 里。所以不能用 grep 静态页面判断"
+            echo "那些 selector 是否存在 —— 早先那版探测的做法本身就是错的。"
+            echo
+            echo "改为判断拿到的是否是真实的云游戏应用（而非风控/地区拦截页）："
+            echo
+            echo "| 判据 | 是否出现 |"
+            echo "|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ ! -s "$BODY" ]; then
             echo "::error::没拿到 sr.mihoyo.com/cloud 的页面内容"
-            echo "| (无内容) | | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| (无内容) | ❌ |" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           check() {
-            local pattern="$1" where="$2"
+            local pattern="$1"
             if grep -q "$pattern" "$BODY"; then
-              echo "| \`$pattern\` | $where | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| \`$pattern\` | ✅ |" >> "$GITHUB_STEP_SUMMARY"
               echo "  ✅ $pattern"
             else
-              echo "| \`$pattern\` | $where | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| \`$pattern\` | ❌ |" >> "$GITHUB_STEP_SUMMARY"
               echo "  ❌ $pattern"
             fi
           }
 
-          check "mihoyo-login-platform-iframe" "cloud.py:588 _check_login"
-          check "game-player"                  "cloud.py:1230 is_in_game"
-          check "wel-card__content--start"     "cloud.py:635 _click_enter_game"
+          check 'id="app"'
+          check 'clgm-web-app'
+          check 'api-cloudgame.mihoyo.com'
+          check 'mihoyo-account-sdk'
           echo
-          echo "页面大小: $(stat -c%s "$BODY") 字节"
+          echo "页面大小: $(stat -c%s "$BODY") 字节（注意 curl 的 size 字段是 gzip 后大小）"
           echo
-          echo "### 页面首 600 字节（判断是否被风控/地区拦截页替换）"
+          echo "### <title> —— 判断是否被拦截页替换" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          head -c 600 "$BODY" | tr -d '\000' >> "$GITHUB_STEP_SUMMARY" || true
-          echo >> "$GITHUB_STEP_SUMMARY"
+          grep -oE '<title>[^<]*</title>' "$BODY" | head -n 3 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump raw page for offline inspection

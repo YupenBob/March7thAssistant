@@ -1,0 +1,169 @@
+name: "M7A 88 · Container Smoke Test"
+
+# 目的：在让人扫码之前，全自动验证容器链路能否在 GitHub runner 上跑通。
+#
+# 只验证到「二维码已产出」为止，不要求任何人扫码，因此可以反复自动运行。
+# 它回答：
+#   1. ghcr.io 镜像能否在 runner 上拉下来、跑起来
+#   2. 无头 Chrome 在 2 核 / 7GB / 无 GPU 的 runner 上能不能起来
+#   3. 云游戏站点在容器内能否加载、能否走到二维码登录分支
+#   4. 二维码图片能否被取出（这正是 90 号抓取流程依赖的能力）
+#
+# 用很短的登录超时跑，所以几分钟内必然收敛，不会空等。
+
+on:
+  workflow_dispatch:
+    inputs:
+      login_timeout:
+        description: "容器内登录超时（分钟），设小以便快速收敛"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-smoke
+      STATE_DIR: /tmp/m7a-smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare state dir and config
+        run: |
+          set -euo pipefail
+          rm -rf "$STATE_DIR"
+          mkdir -p "$STATE_DIR/UserProfile" "$STATE_DIR/logs" "$STATE_DIR/settings"
+          chmod -R 0777 "$STATE_DIR"
+          cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          T="${{ github.event.inputs.login_timeout }}"
+          python3 - "$STATE_DIR/config.yaml" "$T" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Exit', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: |
+          set -euo pipefail
+          time docker pull "$IMAGE"
+          docker image inspect "$IMAGE" --format '镜像大小: {{.Size}} 字节'
+
+      - name: Start container
+        run: |
+          set -euo pipefail
+          docker run -d \
+            --name "$CNAME" \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_AFTER_FINISH=Exit \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            "$IMAGE"
+          sleep 5
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Wait for QR or terminal state
+        id: wait
+        run: |
+          set -uo pipefail
+          # 最多 12 分钟：拉起的浏览器要下载/启动，云游戏页面要加载
+          deadline=$(( $(date +%s) + 720 ))
+          result=pending
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/smoke.log 2>&1 || true
+            if grep -qE "等待扫码|qrcode_login" /tmp/smoke.log 2>/dev/null; then
+              result=qr_ready; break
+            fi
+            if grep -qE "等待云游戏登录超时" /tmp/smoke.log 2>/dev/null; then
+              result=login_timeout; break
+            fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              result=exited; break
+            fi
+            sleep 10
+          done
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "=== 判定: $result ==="
+          echo "=== 日志尾部 ==="
+          tail -n 120 /tmp/smoke.log || true
+
+      - name: Grab QR image if produced
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/qr
+          docker cp "$CNAME:/m7a/logs/qrcode_login.png" /tmp/qr/ 2>/dev/null \
+            && echo "✅ 取出二维码: $(stat -c%s /tmp/qr/qrcode_login.png) 字节" \
+            || echo "::warning::容器内没有 qrcode_login.png"
+          docker logs "$CNAME" > /tmp/smoke.log 2>&1 || true
+          echo "### 日志中的二维码链接" >> "$GITHUB_STEP_SUMMARY"
+          grep -oE 'https://[^[:space:]]+' /tmp/smoke.log | sort -u | head -n 5 >> "$GITHUB_STEP_SUMMARY" || echo "(无)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnose and teardown
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🧪 容器冒烟测试"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 判定 | \`${{ steps.wait.outputs.result }}\` |"
+            echo "| 镜像 | \`$IMAGE\` |"
+            echo "| shm | 2g |"
+            echo "| 运行时长 | 容器已启动 |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "${{ steps.wait.outputs.result }}" in
+            qr_ready)      echo "✅ **链路全通**：容器 + 无头 Chrome + 云游戏页面 + 二维码分支全部工作。" >> "$GITHUB_STEP_SUMMARY" ;;
+            login_timeout) echo "⚠️ 走到了登录分支但没等到扫码（本测试预期如此，说明二维码分支可达）。" >> "$GITHUB_STEP_SUMMARY" ;;
+            exited)        echo "❌ **容器提前退出** —— 见下方诊断与日志产物。" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)             echo "⏳ 未在时限内收敛，需看日志。" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+          echo
+          echo "### 关键日志信号" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -oE "检测到登录成功|等待扫码|qrcode_login|等待云游戏登录超时|OOMKilled|tab crashed|session not created|Chrome|chromedriver|无法识别|进入云游戏成功" /tmp/smoke.log \
+            | sort | uniq -c | sort -rn >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          echo "### 内存与 OOM 检查" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker inspect "$CNAME" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          free -m >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          docker logs "$CNAME" > smoke.log 2>&1 || true
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: smoke-test
+          path: |
+            smoke.log
+            /tmp/qr/qrcode_login.png
+          if-no-files-found: warn
+          retention-days: 5
+          overwrite: true
