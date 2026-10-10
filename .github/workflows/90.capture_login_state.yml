@@ -24,7 +24,7 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 70
 
     env:
       IMAGE: ghcr.io/moesnow/march7thassistant:latest
@@ -74,12 +74,33 @@ jobs:
           sha256sum "$STATE_DIR/config.yaml" > "$STATE_DIR/config.sha256"
           cat "$STATE_DIR/config.sha256"
 
+      - name: Pre-flight connectivity to mihoyo
+        run: |
+          set -uo pipefail
+          # 实测教训：user.mihoyo.com 在 runner 上会间歇性 ERR_TIMED_OUT，
+          # 直接导致二维码登录失败。先探一次，失败就立刻重试，别等 4 分钟后才发现。
+          for host in "https://sr.mihoyo.com/cloud/" "https://user.mihoyo.com/"; do
+            ok=no
+            for attempt in 1 2 3 4 5; do
+              code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 25 \
+                       -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+                       "$host" 2>/dev/null || echo 000)
+              echo "  [$attempt/5] $host -> $code"
+              if [ "$code" = "200" ]; then ok=yes; break; fi
+              sleep 5
+            done
+            if [ "$ok" != "yes" ]; then
+              echo "::warning::$host 连续 5 次不可达，本次运行大概率失败"
+            fi
+          done
+
       - name: Pull image
         run: docker pull "$IMAGE"
 
       - name: Start container (cloud game + headless)
         run: |
           set -euo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
           docker run -d \
             --name "$CNAME" \
             --shm-size=2g \
@@ -96,24 +117,55 @@ jobs:
           sleep 3
           docker ps -a --filter "name=$CNAME"
 
-      - name: Wait for QR flow
+      - name: Wait for QR flow (with retry on load failure)
         id: qr
         run: |
           set -uo pipefail
-          # 这次 runner 可能要真实拉取并解包约 4GB 镜像，再启动 Chrome，
-          # 因此给 12 分钟。冒烟测试在有镜像缓存时仅需约 16 秒。
-          echo "等待程序进入二维码登录流程（最多 12 分钟）..."
+          # 实测教训：应用在页面加载失败时会自己重试 3 次（每次约 30 秒）后放弃，
+          # 而 E2E 日志里已出现 ERR_TIMED_OUT。这里再加一层外部重启重试。
+          MAX_RELAUNCH=3
+          attempt=0
           found=no
-          deadline=$(( $(date +%s) + 720 ))
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
-            if grep -qE "等待扫码|qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
-            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
-              echo "::warning::容器已退出，先看日志"; break
+          overall_deadline=$(( $(date +%s) + 1500 ))
+          while [ "$attempt" -le "$MAX_RELAUNCH" ] && [ "$found" != "yes" ]; do
+            if [ "$attempt" -gt 0 ]; then
+              echo "::warning::页面加载失败，重启容器重试 ($attempt/$MAX_RELAUNCH)"
             fi
-            sleep 5
+            attempt=$(( attempt + 1 ))
+            deadline=$(( $(date +%s) + 360 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+              if grep -qE "等待扫码|qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
+              if grep -qE "页面加载失败，多次刷新无效" /tmp/m7a.log 2>/dev/null; then
+                echo "检测到应用侧页面加载失败，准备重启容器"
+                break
+              fi
+              if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+                echo "容器已退出"; break
+              fi
+              sleep 5
+            done
+            [ "$found" = "yes" ] && break
+            [ "$(date +%s)" -ge "$overall_deadline" ] && { echo "::warning::总时限到，停止重试"; break; }
+            # 重启容器（保留 profile 与 config）
+            docker rm -f "$CNAME" >/dev/null 2>&1 || true
+            docker run -d \
+              --name "$CNAME" \
+              --shm-size=2g \
+              -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+              -v "$STATE_DIR/logs":/m7a/logs \
+              -v "$STATE_DIR/settings":/m7a/settings \
+              -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+              -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+              -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+              -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+              -e MARCH7TH_AFTER_FINISH=Exit \
+              -e MARCH7TH_LOG_LEVEL=DEBUG \
+              "$IMAGE" >/dev/null
+            sleep 8
           done
-          echo "found=$found" >> "$GITHUB_OUTPUT"
+          echo "found=$found  尝试次数=$attempt" >> "$GITHUB_OUTPUT"
+          echo "found=$found attempts=$attempt"
           echo "=== 容器日志尾部 ==="
           tail -n 100 /tmp/m7a.log || true
 
