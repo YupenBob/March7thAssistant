@@ -1,4 +1,4 @@
-﻿name: "M7A 90 · Capture Login State"
+name: "M7A 90 · Capture Login State"
 
 # 目的：在 Docker 云游戏模式下完成一次人工扫码登录，并把「登录态」抓出来，
 #       用于回答整个方案最关键的一个事实问题：
@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       login_wait_minutes:
-        description: "等待扫码的分钟数（必须小于容器内的登录超时 25 分钟）"
+        description: "等待扫码的分钟数（须小于容器内登录超时，默认 22 < 25）"
         required: false
-        default: "18"
+        default: "22"
       keep_days:
         description: "产物保留天数"
         required: false
@@ -168,16 +168,37 @@ jobs:
           overwrite: true
 
       - name: Wait for scan
+        id: scan
         run: |
           set -uo pipefail
           WAIT="${{ github.event.inputs.login_wait_minutes }}"
-          # 硬上限：容器内登录超时是 25 分钟，等待窗不能超过它，否则用户还没扫完程序就自杀了
-          if [ "$WAIT" -gt 22 ]; then echo "::warning::等待窗被限制为 22 分钟（容器内超时为 25 分钟）"; WAIT=22; fi
-          echo "给你 $WAIT 分钟扫码。请盯住 job summary 里的链接，或下载 qrcode 产物图片。"
+          # 硬上限：容器内登录超时是 25 分钟，等待窗不能超过它
+          if [ "$WAIT" -gt 24 ]; then echo "::warning::等待窗被限制为 24 分钟（容器内超时 25 分钟）"; WAIT=24; fi
+          echo "给你 $WAIT 分钟扫码。二维码链接会持续刷新到本次运行的 Summary。"
           deadline=$(( $(date +%s) + WAIT * 60 ))
           logged_in=no
+          peak=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+
+            # 二维码会过期，程序会自动刷新。把最新的链接实时写进 Summary，
+            # 这样你随时打开看到的都是当前有效的那个。
+            cur=$(grep -oE 'https://user\.mihoyo\.com/login-platform/[^[:space:]]+' /tmp/m7a.log 2>/dev/null | tail -n 1)
+            if [ -n "$cur" ] && [ "$cur" != "$peak" ]; then
+              peak="$cur"
+              {
+                echo "## 🔑 当前有效二维码（$(date -u +%H:%M:%SZ) 更新）"
+                echo
+                echo "### 👉 [点这里打开二维码]($cur)"
+                echo
+                echo '```'
+                echo "$cur"
+                echo '```'
+              } > /tmp/qr_summary.md
+              cat /tmp/qr_summary.md >> "$GITHUB_STEP_SUMMARY"
+              echo "新二维码: $cur"
+            fi
+
             if grep -qE "检测到登录成功|进入云游戏成功" /tmp/m7a.log 2>/dev/null; then
               logged_in=yes; echo "✅ 检测到登录成功"; break
             fi
@@ -191,6 +212,30 @@ jobs:
           done
           echo "logged_in=$logged_in"
           tail -n 80 /tmp/m7a.log || true
+          echo "logged_in=$logged_in" >> "$GITHUB_OUTPUT"
+
+      - name: If never logged in, wait for the app to time out cleanly
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.scan.outputs.logged_in }}" = "yes" ]; then
+            echo "已登录，跳过。"
+            exit 0
+          fi
+          # 没人扫码时，必须等程序自己走到「等待云游戏登录超时」，
+          # 让它以干净状态收尾，profile 才是可用的。
+          deadline=$(( $(date +%s) + 360 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+            if grep -qE "等待云游戏登录超时" /tmp/m7a.log 2>/dev/null; then
+              echo "程序已按预期走到登录超时。"; break
+            fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出。"; break
+            fi
+            sleep 10
+          done
+          tail -n 40 /tmp/m7a.log || true
 
       - name: Stop container
         if: always()
