@@ -1,4 +1,4 @@
-name: "M7A 11 · Verify Login Persistence"
+﻿name: "M7A 91 · Verify Login Persistence"
 
 # 目的：回答整个方案的生死问题
 #   Q: 把上一次抓到的登录态塞回去，能不能【不用扫码】直接进游戏？

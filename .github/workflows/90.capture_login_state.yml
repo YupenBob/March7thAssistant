@@ -1,4 +1,4 @@
-name: "M7A 10 · Capture Login State"
+﻿name: "M7A 90 · Capture Login State"
 
 # 目的：在 Docker 云游戏模式下完成一次人工扫码登录，并把「登录态」抓出来，
 #       用于回答整个方案最关键的一个事实问题：
