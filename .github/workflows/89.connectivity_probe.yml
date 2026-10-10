@@ -1,0 +1,109 @@
+name: "M7A 89 · Connectivity Probe"
+
+# 目的：在让人扫码之前，先花 1 分钟排除一个致命变量 ——
+#       GitHub Actions 的海外数据中心 IP，能不能正常访问米哈游的
+#       云游戏站点与登录平台？
+#
+# 若这里就不通，后面所有工作都没有意义。纯 HTTP 探测，不启动浏览器、不涉及任何凭据。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Egress identity
+        run: |
+          set -uo pipefail
+          echo "### 出口环境"
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| 公网 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+          echo "| 地区 | $(curl -s --max-time 10 https://ipinfo.io/country || echo unknown) |"
+          echo "| ASN | $(curl -s --max-time 10 https://ipinfo.io/org || echo unknown) |"
+
+      - name: Probe mihoyo endpoints
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🌐 米哈游端点连通性"
+            echo
+            echo "| 端点 | HTTP | 耗时(s) | 大小(bytes) | 判定 |"
+            echo "|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          probe() {
+            local label="$1" url="$2" expect="${3:-}"
+            local out
+            out=$(curl -s -o /tmp/body.bin -w '%{http_code} %{time_total}' \
+                       --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+                       "$url" 2>/dev/null) || out="000 0"
+            local code time size verdict
+            code=$(echo "$out" | awk '{print $1}')
+            time=$(echo "$out" | awk '{print $2}')
+            size=$(stat -c%s /tmp/body.bin 2>/dev/null || echo 0)
+            verdict="❌"
+            [ "$code" = "200" ] && [ "$size" -gt 100 ] && verdict="✅"
+            echo "| \`$label\` | $code | $time | $size | $verdict |" >> "$GITHUB_STEP_SUMMARY"
+            printf '%-34s http=%s time=%ss size=%s\n' "$label" "$code" "$time" "$size"
+            cp /tmp/body.bin "/tmp/body_${label}.bin" 2>/dev/null || true
+          }
+
+          probe "sr.mihoyo.com/cloud"        "https://sr.mihoyo.com/cloud"
+          probe "user.mihoyo.com"            "https://user.mihoyo.com/"
+          probe "webapi.account.mihoyo.com"  "https://webapi.account.mihoyo.com/"
+          probe "public-data-api device-fp"  "https://public-data-api.mihoyo.com/device-fp/api/getFp"
+          echo
+
+      - name: Verify expected DOM hooks exist in the page
+        run: |
+          set -uo pipefail
+          BODY="/tmp/body_sr.mihoyo.com/cloud.bin"
+          {
+            echo "## 🔍 关键 DOM 锚点（代码里硬依赖的 selector）"
+            echo
+            echo "| 锚点 | 代码位置 | 是否出现 |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          check() {
+            local label="$1" pattern="$2" where="$3"
+            if [ -f "$BODY" ] && grep -q "$pattern" "$BODY"; then
+              echo "| \`$pattern\` | $where | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+              echo "  ✅ $label"
+            else
+              echo "| \`$pattern\` | $where | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              echo "  ❌ $label"
+            fi
+          }
+
+          check "登录 iframe id"        "mihoyo-login-platform-iframe" "cloud.py:588 _check_login"
+          check "游戏画布 game-player"  "game-player"                  "cloud.py:1230 is_in_game"
+          check "进入游戏按钮"          "wel-card__content--start"     "cloud.py:635 _click_enter_game"
+
+          echo
+          echo "### 页面首 600 字节（判断是否被风控/地区拦截页替换）"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          head -c 600 "$BODY" 2>/dev/null | tr -d '\000' >> "$GITHUB_STEP_SUMMARY" || echo "(无内容)" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe cloud game JS bundle
+        run: |
+          set -uo pipefail
+          # 云游戏的登录态往往依赖前端 bundle 里的鉴权逻辑，确认静态资源可达
+          for u in \
+            "https://sr.mihoyo.com/cloud/" \
+            "https://webstatic.mihoyo.com/" ; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$u" || echo 000)
+            echo "$code  $u"
+          done
