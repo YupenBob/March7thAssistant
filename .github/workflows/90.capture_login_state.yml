@@ -32,8 +32,9 @@ jobs:
       # 刻意放在 /tmp：容器以 root 写入挂载目录后，$GITHUB_WORKSPACE 会残留
       # root 属主文件，Actions 事后清理工作区时会失败。
       STATE_DIR: /tmp/m7a-state
-      # 容器内云游戏登录等待超时（分钟）。必须显著大于 login_wait_minutes，
-      # 否则用户还没扫完码，程序就先因登录超时自行终止了。
+      # 容器内云游戏登录等待超时（分钟）。它从"进入登录流程"时才起算，
+      # 而前面还有镜像拉取/解包（约 4GB）+ 浏览器启动的开销，所以这里的
+      # 12 分钟等码窗口与 22 分钟等人扫码窗口不会叠加超过它。
       LOGIN_TIMEOUT_MIN: "25"
 
     steps:
@@ -99,9 +100,12 @@ jobs:
         id: qr
         run: |
           set -uo pipefail
-          echo "等待程序进入二维码登录流程（最多 10 分钟）..."
+          # 这次 runner 可能要真实拉取并解包约 4GB 镜像，再启动 Chrome，
+          # 因此给 12 分钟。冒烟测试在有镜像缓存时仅需约 16 秒。
+          echo "等待程序进入二维码登录流程（最多 12 分钟）..."
           found=no
-          for i in $(seq 1 120); do
+          deadline=$(( $(date +%s) + 720 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
             if grep -qE "等待扫码|qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
             if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
@@ -118,6 +122,15 @@ jobs:
         run: |
           set -uo pipefail
           docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+          # 先把容器状态摊开，避免"等码超时"时无从判断
+          echo "=== 容器状态 ==="
+          docker ps -a --filter "name=$CNAME"
+          docker inspect "$CNAME" --format 'status={{.State.Status}} exitcode={{.State.ExitCode}} oom={{.State.OOMKilled}}' 2>/dev/null || true
+          echo "=== 日志行数: $(wc -l < /tmp/m7a.log 2>/dev/null || echo 0) ==="
+          echo "=== 关键信号 ==="
+          grep -oE "未登录|正在切换到二维码登录|等待二维码加载|二维码已加载|二维码内容|等待扫码|启动浏览器中|浏览器启动成功|Traceback|Error|错误|超时" /tmp/m7a.log \
+            | sort | uniq -c | sort -rn || true
+
           {
             echo "## 🔑 M7A 登录态抓取"
             echo
@@ -222,9 +235,10 @@ jobs:
             echo "已登录，跳过。"
             exit 0
           fi
-          # 没人扫码时，必须等程序自己走到「等待云游戏登录超时」，
-          # 让它以干净状态收尾，profile 才是可用的。
-          deadline=$(( $(date +%s) + 360 ))
+          # 没人扫码时，等程序自己走到「等待云游戏登录超时」干净收尾。
+          # 注意：这个超时从"进入登录流程"起算，比本 job 的时钟晚很多，
+          # 所以这里给 8 分钟余量，超时也不再等待。
+          deadline=$(( $(date +%s) + 480 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
             if grep -qE "等待云游戏登录超时" /tmp/m7a.log 2>/dev/null; then
