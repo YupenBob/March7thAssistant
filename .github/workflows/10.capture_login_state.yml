@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       login_wait_minutes:
-        description: "等待扫码的分钟数（超时后仍会导出当前状态）"
+        description: "等待扫码的分钟数（必须小于容器内的登录超时 25 分钟）"
         required: false
-        default: "15"
+        default: "18"
       keep_days:
         description: "产物保留天数"
         required: false
@@ -24,24 +24,54 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     env:
       IMAGE: ghcr.io/moesnow/march7thassistant:latest
       CNAME: m7a-capture
-      STATE_DIR: ${{ github.workspace }}/state
+      # 刻意放在 /tmp：容器以 root 写入挂载目录后，$GITHUB_WORKSPACE 会残留
+      # root 属主文件，Actions 事后清理工作区时会失败。
+      STATE_DIR: /tmp/m7a-state
+      # 容器内云游戏登录等待超时（分钟）。必须显著大于 login_wait_minutes，
+      # 否则用户还没扫完码，程序就先因登录超时自行终止了。
+      LOGIN_TIMEOUT_MIN: "25"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Prepare directories
+      - name: Prepare state dir and config
         run: |
           set -euo pipefail
+          rm -rf "$STATE_DIR"
           mkdir -p "$STATE_DIR/UserProfile" "$STATE_DIR/logs" "$STATE_DIR/settings"
-          # 3rdparty/WebBrowser 里除了 UserProfile 都是镜像内构建时下载的浏览器本体，
-          # 这里只挂 UserProfile 子目录，避免把浏览器本体遮掉。
-          ls -la "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR"
+
+          # 用官方示例配置打底，生成容器用的 config.yaml。
+          # 镜像本身不带 config.yaml（Dockerfile 里删掉了），缺失时会静默套用内置默认值，
+          # 这里显式提供以便调长登录超时、并把任务跑完后置为退出。
+          cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$',
+                        'after_finish: Exit', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          else
+            sed -i "s/^cloud_game_login_timeout:.*/cloud_game_login_timeout: $LOGIN_TIMEOUT_MIN/" "$STATE_DIR/config.yaml"
+            sed -i "s/^after_finish:.*/after_finish: Exit/" "$STATE_DIR/config.yaml"
+          fi
+
+          echo "--- 生效的关键配置 ---"
+          grep -E '^(cloud_game_enable|cloud_game_login_timeout|browser_headless_enable|browser_headless_restart_on_not_logged_in|after_finish):' "$STATE_DIR/config.yaml" || true
+          sha256sum "$STATE_DIR/config.yaml" > "$STATE_DIR/config.sha256"
+          cat "$STATE_DIR/config.sha256"
 
       - name: Pull image
         run: docker pull "$IMAGE"
@@ -55,31 +85,33 @@ jobs:
             -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
             -v "$STATE_DIR/logs":/m7a/logs \
             -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
             -e MARCH7TH_CLOUD_GAME_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
             -e MARCH7TH_AFTER_FINISH=Exit \
             -e MARCH7TH_LOG_LEVEL=DEBUG \
             "$IMAGE"
+          sleep 3
           docker ps -a --filter "name=$CNAME"
 
-      - name: Wait for QR code to appear
+      - name: Wait for QR flow
         id: qr
         run: |
           set -uo pipefail
-          echo "等待程序进入二维码登录流程（最多 8 分钟）..."
+          echo "等待程序进入二维码登录流程（最多 10 分钟）..."
           found=no
-          for i in $(seq 1 96); do
+          for i in $(seq 1 120); do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
-            if grep -q "qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
+            if grep -qE "等待扫码|qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
             if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
-              echo "::warning::容器已退出，先看看日志"; break
+              echo "::warning::容器已退出，先看日志"; break
             fi
             sleep 5
           done
           echo "found=$found" >> "$GITHUB_OUTPUT"
           echo "=== 容器日志尾部 ==="
-          tail -n 80 /tmp/m7a.log || true
+          tail -n 100 /tmp/m7a.log || true
 
       - name: Extract QR payload
         if: always()
@@ -89,13 +121,12 @@ jobs:
           {
             echo "## 🔑 M7A 登录态抓取"
             echo
-            echo "### 请用【米游社 APP】扫描下面的链接生成的二维码"
+            echo "### 请用【米游社 APP】扫描下面的链接"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
           # 上游在 _decode_qr_from_element 里会把二维码内容（一个 URL）打进日志
           grep -oE 'https://[^[:space:]]+' /tmp/m7a.log | sort -u > /tmp/all_links.txt || true
-          # 二维码里的就是米游社扫码登录地址
           grep -E 'qrcode|scan|login' /tmp/all_links.txt > /tmp/links.txt || true
           [ -s /tmp/links.txt ] || cp /tmp/all_links.txt /tmp/links.txt
 
@@ -118,21 +149,20 @@ jobs:
             echo "--- 候选链接 ---"; cat /tmp/links.txt
           else
             echo "日志里没抓到链接，请改用 qrcode 产物里的图片。" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::没从日志解出二维码链接"
           fi
 
-          if [ -f "$STATE_DIR/logs/qrcode_login.png" ]; then
-            echo "二维码图片已生成: $(stat -c%s "$STATE_DIR/logs/qrcode_login.png") 字节"
-            echo "图片会作为 artifact 上传。" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::没找到 qrcode_login.png"
-          fi
+          # 从容器里把二维码图片抠出来（比挂载目录更可靠）
+          docker cp "$CNAME:/m7a/logs/qrcode_login.png" /tmp/qrcode_login.png 2>/dev/null \
+            && echo "二维码图片已从容器取出" \
+            || echo "::warning::容器内没找到 qrcode_login.png"
 
       - name: Upload QR image immediately
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: qrcode
-          path: ${{ github.workspace }}/state/logs/qrcode_login.png
+          path: /tmp/qrcode_login.png
           if-no-files-found: warn
           retention-days: 1
           overwrite: true
@@ -141,13 +171,18 @@ jobs:
         run: |
           set -uo pipefail
           WAIT="${{ github.event.inputs.login_wait_minutes }}"
-          echo "给你 $WAIT 分钟扫码。请盯住 job summary 里的链接或 qrcode 产物。"
+          # 硬上限：容器内登录超时是 25 分钟，等待窗不能超过它，否则用户还没扫完程序就自杀了
+          if [ "$WAIT" -gt 22 ]; then echo "::warning::等待窗被限制为 22 分钟（容器内超时为 25 分钟）"; WAIT=22; fi
+          echo "给你 $WAIT 分钟扫码。请盯住 job summary 里的链接，或下载 qrcode 产物图片。"
           deadline=$(( $(date +%s) + WAIT * 60 ))
           logged_in=no
           while [ "$(date +%s)" -lt "$deadline" ]; do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
-            if grep -qE "检测到登录成功|登录完成" /tmp/m7a.log 2>/dev/null; then
+            if grep -qE "检测到登录成功|进入云游戏成功" /tmp/m7a.log 2>/dev/null; then
               logged_in=yes; echo "✅ 检测到登录成功"; break
+            fi
+            if grep -qE "等待云游戏登录超时" /tmp/m7a.log 2>/dev/null; then
+              logged_in=timeout; echo "⏰ 程序侧登录超时"; break
             fi
             if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
               echo "容器已退出"; break
@@ -155,29 +190,26 @@ jobs:
             sleep 10
           done
           echo "logged_in=$logged_in"
-          echo "logged_in=$logged_in" >> "$GITHUB_ENV"
-          tail -n 60 /tmp/m7a.log || true
+          tail -n 80 /tmp/m7a.log || true
 
       - name: Stop container
         if: always()
         run: |
+          docker logs "$CNAME" > "$STATE_DIR/container.log" 2>&1 || true
           docker stop "$CNAME" || true
           docker rm "$CNAME" || true
           # 记录抓取时刻，供 11 号 workflow 判断登录态"活了多少天"
           date -u +%FT%TZ > "$STATE_DIR/logs/.captured_at" || true
-          cat "$STATE_DIR/logs/.captured_at" || true
+          echo "captured_at=$(cat "$STATE_DIR/logs/.captured_at")"
 
       - name: Inspect captured state (this is the real measurement)
         if: always()
         run: |
           set -uo pipefail
-          echo "### 抓到的文件"
-          find "$STATE_DIR" -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 | head -n 100 || true
-          echo
           echo "### UserProfile 体积"
           du -sh "$STATE_DIR/UserProfile" 2>/dev/null || echo "(空)"
           echo
-          echo "### UserProfile 下的子目录（注意：目录名取自 browser_type.capitalize()）"
+          echo "### UserProfile 下的子目录（目录名取自 browser_type.capitalize()）"
           ls -la "$STATE_DIR/UserProfile" 2>/dev/null || echo "(空)"
           echo
           # cloud.py: user_profile_path = BROWSER_INSTALL_PATH/UserProfile/<browser_type.capitalize()>
@@ -188,41 +220,52 @@ jobs:
           done
           if [ -z "$PROF" ]; then
             echo "::warning::没能定位 profile 子目录"
-            exit 0
-          fi
-          echo "定位到 profile: $PROF"
-          echo "PROF=$PROF" >> "$GITHUB_ENV"
-          echo
-          echo "### 登录相关的关键文件"
-          for rel in "Default/Cookies" "Default/Local Storage" "Default/IndexedDB" "Default/Preferences" "Default/Session Storage" "Local State"; do
-            if [ -e "$PROF/$rel" ]; then echo "✅ $rel"; else echo "❌ $rel"; fi
-          done
-          echo
-          echo "### Cookies 明细（含过期时间）—— 这是判断登录态寿命的直接证据"
-          if command -v sqlite3 >/dev/null 2>&1 && [ -f "$PROF/Default/Cookies" ]; then
-            sqlite3 "$PROF/Default/Cookies" \
-              "SELECT host_key, name, length(value) AS vlen, datetime(expires_utc/1000000-11644473600,'unixepoch') AS expires_utc_time FROM cookies ORDER BY host_key, name;" || true
           else
-            echo "(没有 sqlite3 或没有 Cookies 文件，靠 artifact 离线分析)"
+            echo "定位到 profile: $PROF"
+            echo
+            echo "### 登录相关的关键文件"
+            for rel in "Default/Cookies" "Default/Local Storage" "Default/IndexedDB" "Default/Preferences" "Default/Session Storage" "Local State"; do
+              if [ -e "$PROF/$rel" ]; then echo "✅ $rel"; else echo "❌ $rel"; fi
+            done
+            echo
+            echo "### Cookies 明细（含过期时间）—— 判断登录态寿命的直接证据"
+            if command -v sqlite3 >/dev/null 2>&1 && [ -f "$PROF/Default/Cookies" ]; then
+              sqlite3 "$PROF/Default/Cookies" \
+                "SELECT host_key, name, length(value) AS vlen, datetime(expires_utc/1000000-11644473600,'unixepoch') AS expires_utc_time FROM cookies ORDER BY host_key, name;" || true
+            else
+              echo "(没有 sqlite3 或没有 Cookies 文件)"
+            fi
+            echo
+            echo "### localStorage (leveldb) 文件"
+            ls -la "$PROF/Default/Local Storage/leveldb" 2>/dev/null | head -n 20 || true
           fi
-          echo
-          echo "### localStorage 里云游戏相关的键"
-          if command -v sqlite3 >/dev/null 2>&1 && [ -f "$PROF/Default/Local Storage/leveldb/LOG" ]; then :; fi
-          ls -la "$PROF/Default/Local Storage/leveldb" 2>/dev/null | head -n 20 || true
+
+      - name: Check whether config.yaml was mutated
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "### config.yaml 是否被程序改写（关系到能否安全挂载）"
+          if sha256sum -c "$STATE_DIR/config.sha256" 2>/dev/null; then
+            echo "✅ 未被改写"
+          else
+            echo "⚠️ 被程序改写过 —— 后续若要挂载自定义配置需要改为容器内副本"
+            diff <(sed 's/[[:space:]]*$//' assets/config/config.example.yaml) \
+                 <(sed 's/[[:space:]]*$//' "$STATE_DIR/config.yaml") | head -n 40 || true
+          fi
 
       - name: Pack login state
         if: always()
         run: |
           set -euo pipefail
-          tar -czf m7a-login-state.tar.gz -C "$STATE_DIR" UserProfile settings logs 2>/dev/null || \
-          tar -czf m7a-login-state.tar.gz -C "$STATE_DIR" . || true
-          ls -lh m7a-login-state.tar.gz
+          tar -czf /tmp/m7a-login-state.tar.gz -C "$STATE_DIR" UserProfile settings logs config.yaml 2>/dev/null \
+            || tar -czf /tmp/m7a-login-state.tar.gz -C "$STATE_DIR" . || true
+          ls -lh /tmp/m7a-login-state.tar.gz
 
       - name: Upload login state
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: m7a-login-state
-          path: m7a-login-state.tar.gz
+          path: /tmp/m7a-login-state.tar.gz
           retention-days: ${{ github.event.inputs.keep_days }}
           if-no-files-found: error

@@ -3,9 +3,9 @@ name: "M7A 11 · Verify Login Persistence"
 # 目的：回答整个方案的生死问题
 #   Q: 把上一次抓到的登录态塞回去，能不能【不用扫码】直接进游戏？
 #
-# 这个 workflow 与 10 号的区别：全程无头、不提供任何扫码机会。
-#   - 如果日志出现「检测到登录成功」且【没有】qr/二维码 → 登录态可移植 ✅
-#   - 如果日志出现「请使用手机米游社 APP 扫描二维码登录」 → 需要重新扫码 ❌
+# 与 10 号的区别：不提供任何人工扫码机会（不传二维码、等待窗只有几分钟）。
+#   - 出现「检测到登录成功」且【没有】扫码提示 → 登录态可移植 ✅
+#   - 出现「请使用手机米游社 APP 扫描」        → 需要重新扫码 ❌
 #
 # 建议在不同日期重复跑，记录「登录态存活了几天、跨不跨 runner」。
 
@@ -19,7 +19,7 @@ on:
       wait_minutes:
         description: "最多观察多少分钟"
         required: false
-        default: "12"
+        default: "10"
 
 permissions:
   contents: read
@@ -32,7 +32,9 @@ jobs:
     env:
       IMAGE: ghcr.io/moesnow/march7thassistant:latest
       CNAME: m7a-verify
-      STATE_DIR: ${{ github.workspace }}/state
+      # 与 10 号一致：放 /tmp，避免容器 root 污染 $GITHUB_WORKSPACE
+      STATE_DIR: /tmp/m7a-state
+      LOGIN_TIMEOUT_MIN: "25"
 
     steps:
       - name: Checkout
@@ -42,28 +44,43 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           name: ${{ github.event.inputs.state_artifact }}
-          path: downloaded
+          path: /tmp/downloaded
 
       - name: Unpack state
         run: |
           set -euo pipefail
+          rm -rf "$STATE_DIR"
           mkdir -p "$STATE_DIR"
-          TARBALL="$(find downloaded -name '*.tar.gz' | head -n 1)"
+          TARBALL="$(find /tmp/downloaded -name '*.tar.gz' | head -n 1)"
           if [ -z "$TARBALL" ]; then echo "::error::没找到 tar.gz"; exit 1; fi
           echo "解包 $TARBALL"
           tar -xzf "$TARBALL" -C "$STATE_DIR"
+
           # 容器内以 root 运行，挂载目录需要可写
           mkdir -p "$STATE_DIR/UserProfile" "$STATE_DIR/logs" "$STATE_DIR/settings"
           chmod -R 0777 "$STATE_DIR" || true
+
+          # 若无 config.yaml（10 号早期版本没打包），现场生成一份
+          if [ ! -f "$STATE_DIR/config.yaml" ]; then
+            cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          fi
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$',
+                        'after_finish: Exit', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          fi
+
           echo "--- 解包结果 ---"
           du -sh "$STATE_DIR"/* 2>/dev/null || true
-          ls -la "$STATE_DIR/UserProfile" 2>/dev/null || true
-          # 记录登录态的抓取时间，用于计算"存活了多久"
-          if [ -f "$STATE_DIR/logs/.captured_at" ]; then
-            cat "$STATE_DIR/logs/.captured_at"
-          else
-            echo "captured_at=unknown（10 号 workflow 未写入时间戳）"
-          fi
+          echo "--- 登录态抓取时间 ---"
+          cat "$STATE_DIR/logs/.captured_at" 2>/dev/null || echo "unknown（10 号未写入时间戳）"
 
       - name: Pull image
         run: docker pull "$IMAGE"
@@ -71,8 +88,7 @@ jobs:
       - name: Start container — NO QR ALLOWED
         run: |
           set -euo pipefail
-          # 关键：不设置任何交互可能。若登录态无效，程序会在 headless 下
-          # 自行走二维码流程（因为我们把 restart_on_not_logged_in 设为 false），
+          # 关键：不设置任何交互可能。若登录态无效，程序会自行走二维码流程，
           # 那正是我们要观测的"失败信号"。
           docker run -d \
             --name "$CNAME" \
@@ -80,6 +96,7 @@ jobs:
             -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
             -v "$STATE_DIR/logs":/m7a/logs \
             -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
             -e MARCH7TH_CLOUD_GAME_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
@@ -112,7 +129,7 @@ jobs:
           echo "result=$result" >> "$GITHUB_OUTPUT"
           echo "=== 判定结果: $result ==="
           echo "=== 日志尾部 ==="
-          tail -n 100 /tmp/m7a.log || true
+          tail -n 120 /tmp/m7a.log || true
 
       - name: Verdict
         if: always()
@@ -125,8 +142,10 @@ jobs:
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| 结果 | \`$RESULT\` |"
-            echo "| 触发时间 | $(date -u +%FT%TZ) |"
+            echo "| 登录态抓取于 | $(cat "$STATE_DIR/logs/.captured_at" 2>/dev/null || echo unknown) |"
+            echo "| 本次运行 | $(date -u +%FT%TZ) |"
             echo "| runner | ${{ runner.name }} / ${{ runner.os }} |"
+            echo "| 公网 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
           case "$RESULT" in
@@ -137,20 +156,16 @@ jobs:
             container_exited)
               echo "⚠️ **容器自行退出**：需要看日志判断是任务跑完了还是启动失败。" >> "$GITHUB_STEP_SUMMARY" ;;
             *)
-              echo "⏳ **超时未判定**：${{ github.event.inputs.wait_minutes }} 分钟内既没登录也没要求扫码。" >> "$GITHUB_STEP_SUMMARY" ;;
+              echo "⏳ **超时未判定**：既没登录也没要求扫码。" >> "$GITHUB_STEP_SUMMARY" ;;
           esac
-          echo
-          echo '### 环境指纹（用于对比「换 IP 会不会掉登录」）' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "public_ip=$(curl -s --max-time 10 https://api.ipify.org || echo unknown)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump log
         if: always()
         run: |
-          docker logs "$CNAME" > m7a-run.log 2>&1 || true
+          docker logs "$CNAME" > /tmp/m7a-run.log 2>&1 || true
           docker stop "$CNAME" || true
           docker rm "$CNAME" || true
+          cp /tmp/m7a-run.log m7a-run.log 2>/dev/null || true
 
       - name: Upload run log
         if: always()
