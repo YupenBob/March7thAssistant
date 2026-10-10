@@ -112,10 +112,11 @@ jobs:
             echo "=== 完整页面（$(stat -c%s "$BODY") 字节）==="
             cat "$BODY"
             echo
-            echo "=== </html> 之后是否还有内容 ==="
+            echo "=== 行数 ==="
             wc -l "$BODY"
-            echo "=== 是否像 SPA 挂载点 ==="
+            echo "=== SPA 挂载点 ==="
             grep -oE '<div id="[^"]*"' "$BODY" | sort -u | head -n 20 || true
+            echo "=== 引用的 JS ==="
             grep -oE 'src="[^"]*\.js[^"]*"' "$BODY" | head -n 20 || true
           else
             echo "::error::sr.mihoyo.com/cloud 没返回内容"
@@ -132,14 +133,3 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
           overwrite: true
-
-      - name: Probe cloud game JS bundle
-        run: |
-          set -uo pipefail
-          # 云游戏的登录态往往依赖前端 bundle 里的鉴权逻辑，确认静态资源可达
-          for u in \
-            "https://sr.mihoyo.com/cloud/" \
-            "https://webstatic.mihoyo.com/" ; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$u" || echo 000)
-            echo "$code  $u"
-          done
