@@ -104,6 +104,35 @@ jobs:
           echo >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Dump raw page for offline inspection
+        run: |
+          set -uo pipefail
+          BODY="/tmp/p_sr-cloud.bin"
+          if [ -s "$BODY" ]; then
+            echo "=== 完整页面（$(stat -c%s "$BODY") 字节）==="
+            cat "$BODY"
+            echo
+            echo "=== </html> 之后是否还有内容 ==="
+            wc -l "$BODY"
+            echo "=== 是否像 SPA 挂载点 ==="
+            grep -oE '<div id="[^"]*"' "$BODY" | sort -u | head -n 20 || true
+            grep -oE 'src="[^"]*\.js[^"]*"' "$BODY" | head -n 20 || true
+          else
+            echo "::error::sr.mihoyo.com/cloud 没返回内容"
+          fi
+
+      - name: Upload raw page
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: probe-raw-page
+          path: |
+            /tmp/p_sr-cloud.bin
+            /tmp/p_user-passport.bin
+          if-no-files-found: warn
+          retention-days: 3
+          overwrite: true
+
       - name: Probe cloud game JS bundle
         run: |
           set -uo pipefail
