@@ -163,6 +163,9 @@ jobs:
         run: |
           docker stop "$CNAME" || true
           docker rm "$CNAME" || true
+          # 记录抓取时刻，供 11 号 workflow 判断登录态"活了多少天"
+          date -u +%FT%TZ > "$STATE_DIR/logs/.captured_at" || true
+          cat "$STATE_DIR/logs/.captured_at" || true
 
       - name: Inspect captured state (this is the real measurement)
         if: always()
