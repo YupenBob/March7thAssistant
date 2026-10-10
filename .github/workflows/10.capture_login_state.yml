@@ -135,6 +135,7 @@ jobs:
           path: ${{ github.workspace }}/state/logs/qrcode_login.png
           if-no-files-found: warn
           retention-days: 1
+          overwrite: true
 
       - name: Wait for scan
         run: |
