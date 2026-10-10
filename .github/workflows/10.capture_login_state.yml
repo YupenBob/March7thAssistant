@@ -1,0 +1,224 @@
+name: "M7A 10 · Capture Login State"
+
+# 目的：在 Docker 云游戏模式下完成一次人工扫码登录，并把「登录态」抓出来，
+#       用于回答整个方案最关键的一个事实问题：
+#       —— 登录态到底能不能被保存下来、并在别的地方恢复？
+#
+# 手动触发。跑起来后请看 job summary，里面有二维码链接和图片。
+
+on:
+  workflow_dispatch:
+    inputs:
+      login_wait_minutes:
+        description: "等待扫码的分钟数（超时后仍会导出当前状态）"
+        required: false
+        default: "15"
+      keep_days:
+        description: "产物保留天数"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-capture
+      STATE_DIR: ${{ github.workspace }}/state
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          mkdir -p "$STATE_DIR/UserProfile" "$STATE_DIR/logs" "$STATE_DIR/settings"
+          # 3rdparty/WebBrowser 里除了 UserProfile 都是镜像内构建时下载的浏览器本体，
+          # 这里只挂 UserProfile 子目录，避免把浏览器本体遮掉。
+          ls -la "$STATE_DIR"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Start container (cloud game + headless)
+        run: |
+          set -euo pipefail
+          docker run -d \
+            --name "$CNAME" \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_AFTER_FINISH=Exit \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            "$IMAGE"
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Wait for QR code to appear
+        id: qr
+        run: |
+          set -uo pipefail
+          echo "等待程序进入二维码登录流程（最多 8 分钟）..."
+          found=no
+          for i in $(seq 1 96); do
+            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+            if grep -q "qrcode_login" /tmp/m7a.log 2>/dev/null; then found=yes; break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "::warning::容器已退出，先看看日志"; break
+            fi
+            sleep 5
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          echo "=== 容器日志尾部 ==="
+          tail -n 80 /tmp/m7a.log || true
+
+      - name: Extract QR payload
+        if: always()
+        run: |
+          set -uo pipefail
+          docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+          {
+            echo "## 🔑 M7A 登录态抓取"
+            echo
+            echo "### 请用【米游社 APP】扫描下面的链接生成的二维码"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 上游在 _decode_qr_from_element 里会把二维码内容（一个 URL）打进日志
+          grep -oE 'https://[^[:space:]]+' /tmp/m7a.log | sort -u > /tmp/all_links.txt || true
+          # 二维码里的就是米游社扫码登录地址
+          grep -E 'qrcode|scan|login' /tmp/all_links.txt > /tmp/links.txt || true
+          [ -s /tmp/links.txt ] || cp /tmp/all_links.txt /tmp/links.txt
+
+          if [ -s /tmp/links.txt ]; then
+            link="$(head -n 1 /tmp/links.txt)"
+            {
+              echo "扫码链接：\`$link\`"
+              echo
+              echo "👉 **[点这里打开二维码](${link})** —— 页面本身就是二维码"
+              echo
+              echo "或者把这段链接贴进任意二维码生成器（如 cli.im）再扫。"
+              echo
+              echo "<details><summary>全部候选链接</summary>"
+              echo
+              echo '```'
+              cat /tmp/links.txt
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "--- 候选链接 ---"; cat /tmp/links.txt
+          else
+            echo "日志里没抓到链接，请改用 qrcode 产物里的图片。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f "$STATE_DIR/logs/qrcode_login.png" ]; then
+            echo "二维码图片已生成: $(stat -c%s "$STATE_DIR/logs/qrcode_login.png") 字节"
+            echo "图片会作为 artifact 上传。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::没找到 qrcode_login.png"
+          fi
+
+      - name: Upload QR image immediately
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: qrcode
+          path: ${{ github.workspace }}/state/logs/qrcode_login.png
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Wait for scan
+        run: |
+          set -uo pipefail
+          WAIT="${{ github.event.inputs.login_wait_minutes }}"
+          echo "给你 $WAIT 分钟扫码。请盯住 job summary 里的链接或 qrcode 产物。"
+          deadline=$(( $(date +%s) + WAIT * 60 ))
+          logged_in=no
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+            if grep -qE "检测到登录成功|登录完成" /tmp/m7a.log 2>/dev/null; then
+              logged_in=yes; echo "✅ 检测到登录成功"; break
+            fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          echo "logged_in=$logged_in"
+          echo "logged_in=$logged_in" >> "$GITHUB_ENV"
+          tail -n 60 /tmp/m7a.log || true
+
+      - name: Stop container
+        if: always()
+        run: |
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+
+      - name: Inspect captured state (this is the real measurement)
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "### 抓到的文件"
+          find "$STATE_DIR" -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 | head -n 100 || true
+          echo
+          echo "### UserProfile 体积"
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || echo "(空)"
+          echo
+          echo "### UserProfile 下的子目录（注意：目录名取自 browser_type.capitalize()）"
+          ls -la "$STATE_DIR/UserProfile" 2>/dev/null || echo "(空)"
+          echo
+          # cloud.py: user_profile_path = BROWSER_INSTALL_PATH/UserProfile/<browser_type.capitalize()>
+          # 默认 browser_type=integrated -> Integrated
+          PROF=""
+          for cand in Integrated Chrome Edge Chromium; do
+            if [ -d "$STATE_DIR/UserProfile/$cand" ]; then PROF="$STATE_DIR/UserProfile/$cand"; break; fi
+          done
+          if [ -z "$PROF" ]; then
+            echo "::warning::没能定位 profile 子目录"
+            exit 0
+          fi
+          echo "定位到 profile: $PROF"
+          echo "PROF=$PROF" >> "$GITHUB_ENV"
+          echo
+          echo "### 登录相关的关键文件"
+          for rel in "Default/Cookies" "Default/Local Storage" "Default/IndexedDB" "Default/Preferences" "Default/Session Storage" "Local State"; do
+            if [ -e "$PROF/$rel" ]; then echo "✅ $rel"; else echo "❌ $rel"; fi
+          done
+          echo
+          echo "### Cookies 明细（含过期时间）—— 这是判断登录态寿命的直接证据"
+          if command -v sqlite3 >/dev/null 2>&1 && [ -f "$PROF/Default/Cookies" ]; then
+            sqlite3 "$PROF/Default/Cookies" \
+              "SELECT host_key, name, length(value) AS vlen, datetime(expires_utc/1000000-11644473600,'unixepoch') AS expires_utc_time FROM cookies ORDER BY host_key, name;" || true
+          else
+            echo "(没有 sqlite3 或没有 Cookies 文件，靠 artifact 离线分析)"
+          fi
+          echo
+          echo "### localStorage 里云游戏相关的键"
+          if command -v sqlite3 >/dev/null 2>&1 && [ -f "$PROF/Default/Local Storage/leveldb/LOG" ]; then :; fi
+          ls -la "$PROF/Default/Local Storage/leveldb" 2>/dev/null | head -n 20 || true
+
+      - name: Pack login state
+        if: always()
+        run: |
+          set -euo pipefail
+          tar -czf m7a-login-state.tar.gz -C "$STATE_DIR" UserProfile settings logs 2>/dev/null || \
+          tar -czf m7a-login-state.tar.gz -C "$STATE_DIR" . || true
+          ls -lh m7a-login-state.tar.gz
+
+      - name: Upload login state
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: m7a-login-state
+          path: m7a-login-state.tar.gz
+          retention-days: ${{ github.event.inputs.keep_days }}
+          if-no-files-found: error
