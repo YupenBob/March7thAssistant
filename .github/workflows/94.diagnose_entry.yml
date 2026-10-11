@@ -37,6 +37,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Probe cloudgame backend reachability
+        run: |
+          set -uo pipefail
+          pip install --quiet requests
+          echo "=== 从 runner 探测云游戏调度后端 ==="
+          python3 .github/scripts/probe_cloudgame_api.py || true
       - name: Install cryptography
         run: pip install --quiet cryptography
 
