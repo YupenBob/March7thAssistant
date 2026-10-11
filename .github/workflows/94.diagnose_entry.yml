@@ -1,0 +1,137 @@
+name: "M7A 94 · Diagnose Cloud Entry"
+
+# 目的：查明「进入云游戏失败」的真实原因。
+#
+# 现状：登录态在云端有效（能读到剩余时长 600 分钟），但点击进入游戏后
+# 页面停在第四种状态 —— 应用等的三个 selector（game_running / in_queue /
+# select_queue）一个都没出现，10 秒后抛空 TimeoutException。
+#
+# 本 workflow 复用应用自身的模块驱动浏览器（参数/profile/配置与正式运行一致），
+# 把每一步的 DOM、可见文本、截图都 dump 出来，用于定位真实状态。
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset_profile:
+        description: "是否用全新 profile（true 则不带登录态，仅用于对比）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-diag
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cryptography
+        run: pip install --quiet cryptography
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${M7A_PROFILE_KEY:-}" ]; then echo "::error::Secret 未设置"; exit 1; fi
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          ls -lh /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          echo "=== profile 内容 ==="
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+          for f in "Default/Cookies" "Default/Preferences" "Default/Local Storage"; do
+            [ -e "$STATE_DIR/UserProfile/Integrated/$f" ] && echo "  ✅ $f" || echo "  ❌ $f"
+          done
+          mkdir -p "$STATE_DIR/logs"
+
+      - name: Prepare config
+        run: |
+          set -euo pipefail
+          if [ ! -f "$STATE_DIR/config.yaml" ]; then
+            cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          fi
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish|cloud_game_max_queue_time):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run diagnostic (no auto-loop)
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          # 把诊断脚本挂进去，绕过 main.py 的自动流程
+          docker run -d \
+            --name "$CNAME" \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_enter.py":/m7a/diag_enter.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            "$IMAGE" python diag_enter.py
+          sleep 5
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Collect diagnostic output
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/diag.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/diag.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/diag.log 2>&1 || true
+          echo "=== 诊断输出 ==="
+          cat /tmp/diag.log | tail -n 200
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+          # 放开权限，让 runner 用户能读到 dump 出来的文件
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+          echo "=== dump 文件 ==="
+          find "$STATE_DIR/logs" -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: m7a-diag
+          path: |
+            /tmp/diag.log
+            /tmp/m7a-state/logs
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
