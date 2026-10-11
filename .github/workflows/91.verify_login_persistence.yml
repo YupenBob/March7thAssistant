@@ -41,10 +41,44 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download captured login state
-        uses: actions/download-artifact@v5
-        with:
-          name: ${{ github.event.inputs.state_artifact }}
-          path: /tmp/downloaded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # actions/download-artifact 默认只能取同一次 run 的产物，
+          # 跨 run 必须走 API。这里直接用 API 定位并下载。
+          ART_NAME="${{ github.event.inputs.state_artifact }}"
+          mkdir -p /tmp/downloaded
+          echo "查找产物: $ART_NAME"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+               -o /tmp/arts.json
+          python3 - <<PY
+          import json, sys
+          arts = json.load(open("/tmp/arts.json"))["artifacts"]
+          name = "$ART_NAME"
+          match = [a for a in arts if a["name"] == name and not a["expired"]]
+          if not match:
+              print(f"::error::找不到未过期的产物 {name}；现有：")
+              for a in arts[:10]:
+                  print(f"  {a['name']} expired={a['expired']} run={a['workflow_run']['id']}")
+              sys.exit(1)
+          match.sort(key=lambda a: a["created_at"], reverse=True)
+          best = match[0]
+          print(f"选中产物 id={best['id']} 大小={best['size_in_bytes']} 创建于={best['created_at']}")
+          print(f"来自 run {best['workflow_run']['id']}")
+          open("/tmp/art_id.txt", "w").write(str(best["id"]))
+          PY
+          ART_ID="$(cat /tmp/art_id.txt)"
+          echo "下载 artifact $ART_ID ..."
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip" \
+               -o /tmp/art.zip
+          ls -lh /tmp/art.zip
+          cd /tmp/downloaded && python3 -c "import zipfile; zipfile.ZipFile('/tmp/art.zip').extractall('.')"
+          echo "=== 解压结果 ==="
+          find /tmp/downloaded -type f -printf '%10s  %p\n' | sort -k2
 
       - name: Unpack state
         run: |
