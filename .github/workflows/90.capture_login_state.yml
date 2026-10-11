@@ -102,31 +102,37 @@ jobs:
       - name: Pull image
         run: docker pull "$IMAGE"
 
-      - name: Check container can write (non-root)
+      - name: Check container can write (mirrors real mounts)
         run: |
           set -euo pipefail
-          # 以 runner uid 运行容器可避免挂载目录被 root 占有、
-          # 导致后续 tar 打包时 "Permission denied"。
-          # 但代价是非 root 可能写不了镜像内某些目录，先探一次。
-          echo "=== 容器内可写性预检 ==="
-          docker run --rm --user "$(id -u):$(id -g)" "$IMAGE" sh -c '
-            for d in /m7a/3rdparty/WebBrowser /m7a/logs /m7a/settings /tmp; do
-              if touch "$d/.wtest" 2>/dev/null; then
-                echo "  OK   $d (uid=$(id -u))"; rm -f "$d/.wtest"
-              else
-                echo "  FAIL $d (uid=$(id -u))"
-              fi
-            done
-            echo "  whoami: $(id -u):$(id -g)"
-            python --version 2>&1 | sed "s/^/  /"
-          '
+          # 实测教训：用 --user $(id -u) 跑容器会让应用无法在 /m7a 下创建
+          # config.yaml 的临时文件（原子写入需要目录可写，而 /m7a 属 root），
+          # 而 config.py:400 的 mkstemp 在 try 之外 —— 直接抛异常打死进程。
+          # 所以容器必须以 root 运行，改为在容器结束后统一放开权限。
+          # 这里只验证「root 能否写进真实挂载点」，确保后续 tar 有东西可打。
+          echo "=== 挂载点可写性预检（以 root 运行，与真实启动一致）==="
+          docker run --rm \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            "$IMAGE" sh -c '
+              for d in /m7a/3rdparty/WebBrowser/UserProfile /m7a/logs /m7a/settings; do
+                if touch "$d/.wtest" 2>/dev/null; then
+                  echo "  OK   $d"; rm -f "$d/.wtest"
+                else
+                  echo "  FAIL $d  <- 该挂载点不可写"
+                fi
+              done
+              echo "  uid=$(id -u) gid=$(id -g)"
+            '
+          echo "=== 预检后可读性（tar 将以当前用户执行）==="
+          ls -ld "$STATE_DIR" "$STATE_DIR"/* 2>/dev/null || true
 
       - name: Start container (cloud game + headless)
         run: |
           set -euo pipefail
           docker rm -f "$CNAME" 2>/dev/null || true
           docker run -d \
-            --user "$(id -u):$(id -g)" \
             --name "$CNAME" \
             --shm-size=2g \
             -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
@@ -174,7 +180,6 @@ jobs:
             # 重启容器（保留 profile 与 config）
             docker rm -f "$CNAME" >/dev/null 2>&1 || true
             docker run -d \
-            --user "$(id -u):$(id -g)" \
               --name "$CNAME" \
               --shm-size=2g \
               -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
@@ -351,15 +356,34 @@ jobs:
           echo "未检测到登录成功，直接收尾并导出当前状态。"
           tail -n 40 /tmp/m7a.log || true
 
-      - name: Stop container
+      - name: Stop container and relax permissions
         if: always()
         run: |
+          set -uo pipefail
           docker logs "$CNAME" > "$STATE_DIR/container.log" 2>&1 || true
           docker stop "$CNAME" || true
           docker rm "$CNAME" || true
+
+          # 容器以 root 运行，profile 目录会归 root 且可能带 700 权限，
+          # runner 用户读不了 → tar 只能打出空壳（实测产物只有 89KB，
+          # 而真实 profile 约 200MB）。这里统一放开读写与遍历权限。
+          echo "=== 放开权限前 ==="
+          ls -ld "$STATE_DIR" "$STATE_DIR"/UserProfile 2>/dev/null || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c \
+            'chmod -R a+rwX /s 2>/dev/null || true; echo done' || \
+            sudo chmod -R a+rwX "$STATE_DIR" 2>/dev/null || true
+          echo "=== 放开权限后 ==="
+          ls -ld "$STATE_DIR" "$STATE_DIR"/UserProfile 2>/dev/null || true
+          echo "=== 当前用户能否读取 profile ==="
+          if [ -d "$STATE_DIR/UserProfile/Integrated" ]; then
+            du -sh "$STATE_DIR/UserProfile/Integrated" 2>/dev/null || echo "  (读不了)"
+          else
+            echo "  (Integrated 不存在)"
+          fi
           # 记录抓取时刻，供 11 号 workflow 判断登录态"活了多少天"
-          date -u +%FT%TZ > "$STATE_DIR/logs/.captured_at" || true
-          echo "captured_at=$(cat "$STATE_DIR/logs/.captured_at")"
+          date -u +%FT%TZ > "$STATE_DIR/logs/.captured_at" 2>/dev/null || \
+            echo "$(date -u +%FT%TZ)" | sudo tee "$STATE_DIR/logs/.captured_at" >/dev/null 2>&1 || true
+          echo "captured_at=$(cat "$STATE_DIR/logs/.captured_at" 2>/dev/null || echo unknown)"
 
       - name: Inspect captured state (this is the real measurement)
         if: always()
