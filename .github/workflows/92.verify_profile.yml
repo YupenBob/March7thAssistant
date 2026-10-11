@@ -1,0 +1,219 @@
+name: "M7A 92 · Verify Profile Works (No QR)"
+
+# 目的：决定性验证 —— 把本机小助手登录出的 profile 搬到 GitHub runner 上，
+#       能不能【完全不扫码】直接进入已登录状态？
+#
+# 为什么这是个真问题：
+#   mihoyo 的会话可能绑定签发时的网络环境。本机登录（住宅/代理 IP）
+#   与 Azure 数据中心 IP 不同，若服务端拒绝，这条路就走不通。
+#   必须先实测，不能假设。
+#
+# 输入：一个用 pack_profile.py 加密的 profile 密文（放在仓库 m7a-state 分支）。
+#       口令从 Secret M7A_PROFILE_KEY 读取。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_branch:
+        description: "存放密文的仓库分支"
+        required: false
+        default: "m7a-state"
+      profile_path:
+        description: "密文在仓库中的路径"
+        required: false
+        default: "m7a_profile.enc"
+      observe_minutes:
+        description: "观察多少分钟（够应用启动并做出登录判定即可）"
+        required: false
+        default: "6"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-profile-verify
+      STATE_DIR: /tmp/m7a-state
+      # 必须远大于观察窗，避免程序自己先因登录超时退出而干扰判定
+      LOGIN_TIMEOUT_MIN: "25"
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+
+      - name: Fetch encrypted profile from state branch
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "${{ github.event.inputs.profile_branch }}"
+          git show "FETCH_HEAD:${{ github.event.inputs.profile_path }}" > /tmp/m7a_profile.enc
+          ls -lh /tmp/m7a_profile.enc
+          echo "密文 sha256: $(sha256sum /tmp/m7a_profile.enc | cut -d' ' -f1)"
+
+      - name: Decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${M7A_PROFILE_KEY:-}" ]; then
+            echo "::error::Secret M7A_PROFILE_KEY 未设置"
+            exit 1
+          fi
+          pip install --quiet cryptography
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/profile.tar.gz
+
+      - name: Unpack profile into place
+        run: |
+          set -euo pipefail
+          rm -rf "$STATE_DIR"
+          mkdir -p "$STATE_DIR/profile" "$STATE_DIR/logs" "$STATE_DIR/settings"
+          tar -xzf /tmp/profile.tar.gz -C "$STATE_DIR/profile"
+          echo "=== 解包结构 ==="
+          ls -la "$STATE_DIR/profile"
+
+          # tar 里顶层目录名取决于打包时的目录名，这里统一成 Integrated
+          # （cloud.py: BROWSER_INSTALL_PATH/UserProfile/<browser_type.capitalize()>）
+          TOP="$(ls "$STATE_DIR/profile" | head -n 1)"
+          mkdir -p "$STATE_DIR/UserProfile"
+          if [ "$TOP" != "Integrated" ]; then
+            mv "$STATE_DIR/profile/$TOP" "$STATE_DIR/UserProfile/Integrated"
+          else
+            mv "$STATE_DIR/profile/Integrated" "$STATE_DIR/UserProfile/Integrated"
+          fi
+          chmod -R 0777 "$STATE_DIR" || true
+
+          echo "=== 关键文件是否存在 ==="
+          for f in "Default/Cookies" "Default/Preferences" "Default/Local Storage" "Local State"; do
+            if [ -e "$STATE_DIR/UserProfile/Integrated/$f" ]; then echo "  ✅ $f"; else echo "  ❌ $f"; fi
+          done
+          echo "=== 体积 ==="
+          du -sh "$STATE_DIR/UserProfile"
+
+      - name: Prepare config
+        run: |
+          set -euo pipefail
+          cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Start container
+        run: |
+          set -euo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          docker run -d \
+            --name "$CNAME" \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            "$IMAGE"
+          sleep 3
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Observe — expecting NO QR
+        id: observe
+        run: |
+          set -uo pipefail
+          WAIT="${{ github.event.inputs.observe_minutes }}"
+          deadline=$(( $(date +%s) + WAIT * 60 ))
+          result=unknown
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+            # 成功信号：进入游戏或已登录
+            if grep -qE "检测到登录成功|进入云游戏成功|已在游戏中" /tmp/m7a.log 2>/dev/null; then
+              result=no_qr_needed; break
+            fi
+            # 失败信号：要求扫码
+            if grep -qE "请使用手机米游社 APP 扫描|等待扫码|正在切换到二维码登录" /tmp/m7a.log 2>/dev/null; then
+              result=needs_qr; break
+            fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              result=container_exited; break
+            fi
+            sleep 10
+          done
+          [ "$result" = "unknown" ] && result=timeout
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "=== 判定: $result ==="
+          tail -n 120 /tmp/m7a.log || true
+
+      - name: Verdict
+        if: always()
+        run: |
+          set -uo pipefail
+          R="${{ steps.observe.outputs.result }}"
+          {
+            echo "## 🧪 Profile 可移植性验证"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 判定 | \`$R\` |"
+            echo "| runner | ${{ runner.name }} |"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo "| 时间 | $(date -u +%FT%TZ) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$R" in
+            no_qr_needed)
+              echo "✅ **免扫码成功**：本机登录态在云端可用，方案成立。" >> "$GITHUB_STEP_SUMMARY" ;;
+            needs_qr)
+              echo "❌ **仍需扫码**：会话被判定为无效（很可能绑定了网络环境）。" >> "$GITHUB_STEP_SUMMARY" ;;
+            container_exited)
+              echo "⚠️ 容器提前退出，看日志判断原因。" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "⏳ 观察窗内未得出结论。" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+          echo
+          echo "### 关键信号统计" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -oE "未登录|检测到登录成功|正在切换到二维码登录|进入云游戏成功|页面加载超时|ERR_TIMED_OUT|Traceback|读取 Cookie|Cookie" /tmp/m7a.log 2>/dev/null \
+            | sort | uniq -c | sort -rn >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export updated profile
+        if: always()
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -uo pipefail
+          docker logs "$CNAME" > "$STATE_DIR/container.log" 2>&1 || true
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+          if [ -d "$STATE_DIR/UserProfile/Integrated" ]; then
+            tar -czf /tmp/profile-updated.tar.gz -C "$STATE_DIR/UserProfile" Integrated
+            python3 .github/scripts/m7a_profile_crypto.py encrypt /tmp/profile-updated.tar.gz /tmp/m7a_profile.enc \
+              && echo "已重新加密更新后的 profile" \
+              || echo "::warning::重新加密失败"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: profile-verify
+          path: |
+            /tmp/m7a.log
+            /tmp/m7a_profile.enc
+          if-no-files-found: warn
+          retention-days: 5
+          overwrite: true
