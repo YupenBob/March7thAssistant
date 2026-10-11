@@ -24,7 +24,12 @@ def log(msg):
 
 
 def parse_vless(link: str) -> dict:
-    """把 vless:// 链接解析成 xray outbound 配置。"""
+    """把 vless:// 链接解析成 xray outbound 配置。
+
+    支持两种传输：
+      - security=reality（TCP + REALITY，如 xtls-rprx-vision）
+      - security=tls + type=ws（WebSocket over TLS）
+    """
     if not link.startswith("vless://"):
         raise ValueError("只支持 vless:// 链接")
 
@@ -38,26 +43,52 @@ def parse_vless(link: str) -> dict:
     log(f"解析: uuid={uuid[:8]}... host={host} port={port} tag={tag}")
     log(f"参数: {json.dumps(q, ensure_ascii=False)}")
 
-    if q.get("security") != "reality":
-        raise ValueError(f"本脚本只处理 reality，实际 security={q.get('security')}")
-    if not q.get("pbk"):
-        raise ValueError("reality 缺少 pbk（公钥）")
+    security = q.get("security", "none")
+    net_type = q.get("type", "tcp")
+    user_flow = q.get("flow", "")
 
-    stream = {
-        "network": q.get("type", "tcp"),
-        "security": "reality",
-        "realitySettings": {
+    stream = {"network": net_type, "security": security}
+
+    if security == "reality":
+        if not q.get("pbk"):
+            raise ValueError("reality 缺少 pbk（公钥）")
+        stream["realitySettings"] = {
             "serverName": q.get("sni", ""),
             "fingerprint": q.get("fp", "chrome"),
             "publicKey": q["pbk"],
             "shortId": q.get("sid", ""),
             "spiderX": q.get("spx", ""),
-        },
-    }
-    if q.get("flow"):
-        user_flow = q["flow"]
+        }
+
+    elif security == "tls":
+        stream["tlsSettings"] = {
+            "serverName": q.get("sni", host),
+            "fingerprint": q.get("fp", "chrome"),
+            "allowInsecure": q.get("allowInsecure", "0") in ("1", "true"),
+        }
+
+    elif security in ("none", ""):
+        # 无 TLS
+        stream["security"] = "none"
     else:
-        user_flow = ""
+        raise ValueError(f"暂不支持的 security={security}")
+
+    # WebSocket 需要 wsSettings（path 与 host 头）
+    if net_type == "ws":
+        stream["wsSettings"] = {
+            "path": q.get("path", "/"),
+        }
+        if q.get("host"):
+            stream["wsSettings"]["headers"] = {"Host": q["host"]}
+    elif net_type == "grpc":
+        stream["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+    elif net_type in ("tcp", "raw") and q.get("headerType") == "http":
+        stream["tcpSettings"] = {
+            "header": {
+                "type": "http",
+                "request": {"headers": {"Host": [q.get("host", "")]}},
+            }
+        }
 
     outbound = {
         "tag": "proxy",
@@ -135,14 +166,21 @@ def install_xray(version="1.8.24"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--link", default=os.environ.get("M7A_PROXY_LINK", ""))
+    ap.add_argument("--link-file", default="",
+                    help="从文件读取链接（优先级高于 --link）")
     ap.add_argument("--socks-port", type=int, default=10809)
     ap.add_argument("--http-port", type=int, default=10810)
     ap.add_argument("--keep-alive", action="store_true",
                     help="保持代理进程运行，供后续步骤（含容器）使用")
+    ap.add_argument("--outbound-only", action="store_true",
+                    help="只解析并打印 outbound 配置，不下载/启动 xray")
     args = ap.parse_args()
 
+    if args.link_file and os.path.exists(args.link_file):
+        args.link = open(args.link_file, encoding="utf-8").read().strip()
+
     if not args.link:
-        log("错误: 未提供 vless 链接（--link 或环境变量 M7A_PROXY_LINK）")
+        log("错误: 未提供 vless 链接（--link / --link-file / M7A_PROXY_LINK）")
         return 2
 
     try:
@@ -150,6 +188,11 @@ def main():
     except Exception as e:
         log(f"解析失败: {e}")
         return 2
+
+    if args.outbound_only:
+        log("outbound 配置：")
+        log(json.dumps(outbound, ensure_ascii=False, indent=2))
+        return 0
 
     cfg = build_config(outbound, args.socks_port, args.http_port)
     # 目录必须先建好 —— 之前写在 install_xray() 里，导致这里写配置就报
