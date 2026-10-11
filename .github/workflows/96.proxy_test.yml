@@ -1,0 +1,242 @@
+name: "M7A 96 · Proxy Feasibility Test"
+
+# 目的：判断「用代理」能否解决云游戏进不去的问题。
+#
+# 背景：已确认 Azure 直连时，登录成功但点击进入游戏稳定报「网络错误」，
+#       三次重试耗时完全一致，属确定性拒绝而非网络抖动。
+#
+# 本 workflow 回答三个递进的问题：
+#   1. 代理能否在 runner 上连通？出口 IP 在哪个国家？
+#   2. 该出口 IP 访问米哈游各端点是否正常？
+#   3. 走代理时能否真正进入云游戏？（这一步决定成败）
+#
+# 不修改上游代码：代理通过 Chrome 的 --proxy-server 启动参数注入，
+# 使用上游已有的 browser_launch_argument 配置项。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_full_diag:
+        description: "是否继续跑完整诊断（走代理真进游戏，耗时较长）"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-proxy
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+      # 容器内看到的代理地址：用 host 网络最省事
+      PROXY_SOCKS: "socks5://127.0.0.1:10809"
+      PROXY_HTTP: "http://127.0.0.1:10810"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cryptography and requests
+        run: pip install --quiet cryptography requests
+
+      - name: Setup proxy and check egress
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          if [ -z "${M7A_PROXY_LINK:-}" ]; then
+            echo "::error::Secret M7A_PROXY_LINK 未设置"
+            exit 1
+          fi
+          echo "=== 建立代理并查看出口 ==="
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 || {
+              echo "::error::代理建立失败"; exit 1; }
+
+          # xray 是后台启动的，这里重新拉起一个常驻实例供后续步骤使用
+          echo "=== 启动常驻 xray ==="
+          nohup /tmp/xray/xray run -c /tmp/xray/config.json > /tmp/xray/xray-run.log 2>&1 &
+          echo $! > /tmp/xray/pid
+          sleep 5
+          if ! curl -s --max-time 15 -x socks5h://127.0.0.1:10809 https://api.ipify.org; then
+            echo "::error::常驻代理不可用"; cat /tmp/xray/xray-run.log; exit 1
+          fi
+          echo ""
+
+      - name: Probe mihoyo endpoints via proxy
+        run: |
+          set -uo pipefail
+          PX="socks5h://127.0.0.1:10809"
+          {
+            echo "## 🌐 代理出口与米哈游端点"
+            echo
+            echo "| 项 | 直连 | 走代理 |"
+            echo "|---|---|---|"
+            DIRECT=$(curl -s --max-time 15 https://api.ipify.org || echo unknown)
+            VIA=$(curl -s --max-time 20 -x "$PX" https://api.ipify.org || echo unknown)
+            echo "| 出口 IP | \`$DIRECT\` | \`$VIA\` |" 
+            VIA_CC=$(curl -s --max-time 20 -x "$PX" https://ipinfo.io/json || echo '{}')
+            echo "| 代理归属 | - | $(echo "$VIA_CC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("country","?"), d.get("org","?"))' 2>/dev/null || echo '?') |"
+            echo
+            echo "| 端点 | 直连 HTTP | 代理 HTTP |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          probe() {
+            local label="$1" url="$2"
+            local d p
+            d=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 25 \
+                  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+                  "$url" 2>/dev/null || echo 000)
+            p=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 25 -x "$PX" \
+                  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+                  "$url" 2>/dev/null || echo 000)
+            printf '%-30s 直连=%s 代理=%s\n' "$label" "$d" "$p"
+            echo "| \`$label\` | $d | $p |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          probe "sr.mihoyo.com/cloud/"  "https://sr.mihoyo.com/cloud/"
+          probe "user.mihoyo.com"       "https://user.mihoyo.com/"
+          probe "api-cloudgame"         "https://api-cloudgame.mihoyo.com/"
+          probe "cg-hkrpg-api"          "https://cg-hkrpg-api.mihoyo.com/"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          echo "=== profile ==="
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+          for f in "Default/Cookies" "Default/Preferences" "Default/Local Storage"; do
+            [ -e "$STATE_DIR/UserProfile/Integrated/$f" ] && echo "  ✅ $f" || echo "  ❌ $f"
+          done
+          mkdir -p "$STATE_DIR/logs"
+
+      - name: Prepare config WITH proxy launch argument
+        run: |
+          set -euo pipefail
+          if [ ! -f "$STATE_DIR/config.yaml" ]; then
+            cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          fi
+          # 关键：用上游已有的 browser_launch_argument 注入代理，
+          # 不修改任何上游代码。
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" "$PROXY_SOCKS" <<'PY'
+          import re, sys
+          path, timeout, proxy = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          # browser_launch_argument 是列表，追加 --proxy-server
+          new_arg = f'["--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>"]'
+          if re.search(r'^browser_launch_argument:.*$', text, flags=re.M):
+              text = re.sub(r'^browser_launch_argument:.*$',
+                            f'browser_launch_argument: {new_arg}', text, count=1, flags=re.M)
+          else:
+              text += f'\nbrowser_launch_argument: {new_arg}\n'
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          echo "=== 生效配置 ==="
+          grep -E '^(cloud_game_login_timeout|after_finish|browser_launch_argument):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run diagnostic via proxy
+        if: github.event.inputs.run_full_diag == 'true'
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          # 用 host 网络，容器内可直接访问 runner 上的 127.0.0.1:10809
+          docker run -d \
+            --name "$CNAME" \
+            --network host \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_enter.py":/m7a/diag_enter.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            "$IMAGE" python diag_enter.py
+          sleep 5
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Collect diagnostic output
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1200 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/proxy-diag.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/proxy-diag.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/proxy-diag.log 2>&1 || true
+          echo "=== 诊断结论 ==="
+          grep -E "^>>>|_check_login ->|网络错误|网络异常|剩余时长|进入游戏|queue|game_running" /tmp/proxy-diag.log | tail -n 60 || true
+          echo ""
+          echo "=== 是否出现网络错误 ==="
+          echo "次数: $(grep -c '网络错误\|网络异常' /tmp/proxy-diag.log 2>/dev/null || echo 0)"
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+          find "$STATE_DIR/logs" -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 || true
+
+      - name: Verdict
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🧪 代理可行性判定"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 诊断完成 | $(grep -c '诊断完成' /tmp/proxy-diag.log 2>/dev/null || echo 0) |"
+            echo "| 网络错误次数 | $(grep -c '网络错误\|网络异常' /tmp/proxy-diag.log 2>/dev/null || echo 0) |"
+            echo "| 已登录 | $(grep -c '_check_login -> True' /tmp/proxy-diag.log 2>/dev/null || echo 0) |"
+            echo "| 找到进入按钮 | $(grep -c '找到进入按钮 1' /tmp/proxy-diag.log 2>/dev/null || echo 0) |"
+            echo "| 时间 | $(date -u +%FT%TZ) |"
+            echo
+            echo "判定规则：无「网络错误」且找到进入按钮 → 代理有效"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+          echo "已停止代理"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: proxy-test
+          path: |
+            /tmp/proxy-diag.log
+            /tmp/xray/xray-run.log
+            /tmp/m7a-state/logs
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
