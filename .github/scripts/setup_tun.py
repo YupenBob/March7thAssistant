@@ -81,18 +81,28 @@ def parse_vless_outbound(link: str) -> dict:
 
 
 def build_config(outbound: dict) -> dict:
-    """TUN 入站 + auto_route，全部流量走代理。"""
+    """TUN 入站 + auto_route，全部流量走代理。
+
+    DNS 说明：TUN 模式下系统仍会读 /etc/resolv.conf。
+    实测踩过：resolv.conf 指向系统 stub（127.0.0.53）时，
+    auto_route 不会自动接管，导致 curl 报 Could not resolve host。
+    因此这里用最朴素的方式：上游 DNS 走代理，并让 sing-box 写下 resolv.conf。
+    """
     return {
-        "log": {"level": "warn", "timestamp": True},
+        "log": {"level": "info", "timestamp": True},
         "dns": {
+            # 上游用明文 UDP DNS（比 DoH 少一层依赖，TUN 下最稳）
             "servers": [
-                {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query",
-                 "detour": "proxy"},
-                {"tag": "local-dns", "address": "local", "detour": "direct"},
+                {"tag": "remote", "address": "8.8.8.8", "detour": "proxy"},
+                {"tag": "local", "address": "223.5.5.5", "detour": "direct"},
             ],
-            "rules": [{"outbound": "any", "server": "local-dns"}],
-            "final": "proxy-dns",
+            "rules": [
+                # 国内域名走直连 DNS，其余走代理 DNS
+                {"domain_suffix": [".cn"], "server": "local"},
+            ],
+            "final": "remote",
             "strategy": "prefer_ipv4",
+            "independent_cache": True,
         },
         "inbounds": [{
             "type": "tun",
@@ -199,15 +209,37 @@ def main():
         return 1
 
     log(f"sing-box pid={proc.pid}，运行中")
-    log("=== 校验出口 ===")
-    for url in ("https://api.ipify.org", "https://ipinfo.io/json"):
-        try:
-            r = subprocess.run(["curl", "-sS", "--max-time", "25", url],
-                               capture_output=True, text=True)
-            log(f"  {url}: {r.stdout.strip()[:250]}")
-        except Exception as e:
-            log(f"  {url} 失败: {e}")
 
+    # ---- 分步诊断：即便某项失败也继续，便于一次看清全貌 ----
+    log("")
+    log("=== 网络状态诊断 ===")
+    for label, cmd in [
+        ("接口", "ip -brief addr show singtun0"),
+        ("路由", "ip route show | head -n 12"),
+        ("DNS 配置", "cat /etc/resolv.conf"),
+    ]:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True)
+        log(f"  [{label}]")
+        for ln in (r.stdout or "").strip().split("\n")[:12]:
+            log(f"    {ln}")
+
+    log("")
+    log("=== 连通性测试（经 TUN）===")
+    for label, cmd in [
+        ("DNS 解析 api.ipify.org", "getent hosts api.ipify.org || nslookup api.ipify.org 2>&1 | tail -n 3"),
+        ("HTTPS 出口", "curl -sS --max-time 25 https://api.ipify.org"),
+        ("归属", "curl -sS --max-time 25 https://ipinfo.io/json"),
+    ]:
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True)
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        log(f"  [{label}] rc={r.returncode}")
+        if out:
+            log(f"    {out[:250]}")
+        if err:
+            log(f"    stderr: {err[:250]}")
+
+    log("")
     if args.keep_alive:
         log("保持运行中（后续步骤可直接使用，无需配置代理）")
     else:
