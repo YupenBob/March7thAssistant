@@ -1,0 +1,82 @@
+name: "M7A 102 · Measure Ping Timing"
+
+# 目的：量化「节点测速能否在 SDK 的 1000ms 时限内完成」。
+#
+# 从 cg-sdk bundle 读到的机制：
+#   WebSocketRttTester.testRttMs(20, 1000)
+#   要求 20 次往返挤在 1000ms 内，否则该节点 rtt = -1；
+#   页面过滤 rtt < 0 → ping_results 变空；
+#   getNodesInfo 带空结果 → 服务端 {"retcode":-110005,"message":"游戏服务器连接中断"}
+#   → 页面弹通用「网络错误」，且 paasDispatch 永不发出。
+#
+# 本机（用户日常网络）实测：5 个节点里只有 1 个在 1000ms 内完成。
+# 本 workflow 在 runner 上直连/挂代理各测一次，量化差距。
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: "是否挂代理再测"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      - name: Setup proxy (optional)
+        if: github.event.inputs.use_proxy == 'true'
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 --keep-alive || exit 1
+          echo "代理出口: $(curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org)"
+
+      - name: Measure direct
+        run: |
+          set -uo pipefail
+          echo "=== 直连测量 ==="
+          python3 .github/scripts/measure_ping2.py || true
+
+      - name: Measure via proxy
+        if: github.event.inputs.use_proxy == 'true'
+        run: |
+          set -uo pipefail
+          echo "=== 经代理测量 ==="
+          # 注意：Python 裸 socket 不走 HTTP 代理，这里只测直连路径的对照。
+          # 若需要代理路径，容器内由 Chrome 走 --proxy-server，见 96/101 号。
+          echo "（裸 socket 无法走 socks 代理，代理路径请看 101 号钩子输出）"
+          echo "代理出口: $(curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org || echo unknown)"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ⏱️ 节点测速时限测量"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo "| 代理 | ${{ github.event.inputs.use_proxy }} |"
+            echo
+            echo "SDK 要求 20 次往返在 **1000ms** 内完成（testRttMs(20, 1000)）。"
+            echo "本机实测只有 1/5 节点达标，runner 上预计更低。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
