@@ -1,0 +1,187 @@
+name: "M7A 99 · Deep State Dump"
+
+# 目的：查清「进入游戏」最后一步为何不发出 paasDispatch。
+#
+# 已确认的事实链：
+#   - cookie 有效（读到通行证 ID 327459957、剩余时长 600 分钟）
+#   - dispatcher 流程走到 listPingServer -> WS x5 -> getNodesInfo 全部 200
+#   - 之后没有 paasDispatch（真正分配节点的调用），直接弹「网络错误」
+#   - 从 runner 独立测试 5 个 wssping 端点，握手全部成功（101）
+#   -> 网络层没问题，问题在页面内部状态
+#
+# 本 workflow 把页面内部状态全部导出：localStorage / sessionStorage /
+# cookie 清单 / 页面全局变量 / 弹窗完整文本 / 完整 HTML，
+# 并重试点击多次观察是否偶发成功。
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: "是否挂代理"
+        required: false
+        default: "false"
+      extra_flags:
+        description: "额外的 Chrome 启动参数（空格分隔），例如 --enable-unsafe-swiftshader"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-deep
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet cryptography requests
+
+      - name: Setup proxy (optional)
+        if: github.event.inputs.use_proxy == 'true'
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 --keep-alive || exit 1
+          curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org; echo
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          mkdir -p "$STATE_DIR/logs"
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+
+      - name: Prepare config
+        env:
+          USE_PROXY: ${{ github.event.inputs.use_proxy }}
+          EXTRA: ${{ github.event.inputs.extra_flags }}
+        run: |
+          set -euo pipefail
+          [ -f "$STATE_DIR/config.yaml" ] || cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" "$USE_PROXY" "$EXTRA" <<'PY'
+          import json, re, sys
+          path, timeout, use_proxy, extra = sys.argv[1:5]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          args = []
+          if use_proxy == 'true':
+              args += ["--proxy-server=socks5://127.0.0.1:10809",
+                       "--proxy-bypass-list=<-loopback>"]
+          if extra.strip():
+              args += extra.split()
+          val = json.dumps(args)
+          if re.search(r'^browser_launch_argument:.*$', text, flags=re.M):
+              text = re.sub(r'^browser_launch_argument:.*$',
+                            f'browser_launch_argument: {val}', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          print("browser_launch_argument =", val)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish|browser_launch_argument):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run deep diagnostic
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          NETARG=""
+          if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then NETARG="--network host"; fi
+          docker run -d \
+            --name "$CNAME" \
+            $NETARG \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_deep.py":/m7a/diag_deep.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=INFO \
+            "$IMAGE" python diag_deep.py
+          sleep 5
+
+      - name: Collect
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1500 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/deep.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/deep.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/deep.log 2>&1 || true
+          echo "=== 诊断输出 ==="
+          cat /tmp/deep.log | tail -n 200
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+          echo "=== 产物文件 ==="
+          find "$STATE_DIR/logs/diag2" -type f -printf '%10s  %p\n' 2>/dev/null || true
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🔬 深入状态诊断"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 代理 | ${{ github.event.inputs.use_proxy }} |"
+            echo "| 额外参数 | \`${{ github.event.inputs.extra_flags }}\` |"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo
+            echo "### 判定看这里"
+            echo '```'
+            grep -E "^>>>|_check_login|找到按钮|✅|\[ ?[0-9]+s\]" /tmp/deep.log 2>/dev/null | tail -n 60 || echo "(无)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+          echo done
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: deep-state
+          path: |
+            /tmp/deep.log
+            /tmp/m7a-state/logs/diag2
+            /tmp/xray/xray.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
