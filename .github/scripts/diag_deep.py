@@ -134,11 +134,30 @@ def user_aid_text(driver):
         return None
 
 
+def start_with_retry(controller, attempts=4, wait=20):
+    """带重试地启动。实测跨境链路会偶发 ERR_TIMED_OUT 导致页面加载失败。"""
+    for i in range(1, attempts + 1):
+        logmsg(f">>> start_game_process 第 {i}/{attempts} 次")
+        try:
+            if controller.start_game_process():
+                logmsg("    成功")
+                return True
+        except Exception as e:
+            logmsg(f"    异常: {type(e).__name__} {e}")
+        logmsg(f"    失败，{wait}s 后重试")
+        try:
+            controller.stop_game()
+        except Exception:
+            pass
+        time.sleep(wait)
+    return False
+
+
 def main():
     logmsg(">>> 启动控制器")
     controller = CloudGameController(cfg, log)
-    if not controller.start_game_process():
-        logmsg(">>> 启动失败")
+    if not start_with_retry(controller):
+        logmsg(">>> 启动失败（已重试）")
         return 1
     driver = controller.driver
 
