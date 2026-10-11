@@ -1,0 +1,154 @@
+name: "M7A 104 · Screen VLESS Node Latency"
+
+# 目的：在 runner 上端到端测「VLESS 节点能否让云游戏测速达标」。
+#
+# 和 103 号的区别：
+#   103 号测的是已经是 socks5://host:port 的代理；
+#   104 号测的是 vless:// 链接 —— 先用 setup_proxy.py 起 xray，
+#   再用 check_proxy_latency.py 经它测到国内测速节点的 RTT。
+#
+# 判定标准（从 cg-sdk bundle 读出的机制）：
+#   WebSocketRttTester.testRttMs(20, 1000)
+#   -> 20 次 WebSocket 往返总耗时必须 < 1000ms，否则该节点 rtt = -1
+#   -> 页面过滤 rtt < 0，全为 -1 时 ping_results 为空
+#   -> getNodesInfo 返回 retcode -110005「游戏服务器连接中断」
+#
+# 已知基线：
+#   用户本机直连      rtt 23~102ms   20 次 679~2902ms -> 2/5 达标
+#   用户本机经 KR 节点 见本次运行输出
+#   GHA runner 直连   rtt 241~387ms  20 次 5901~10700ms -> 0/5 达标
+#
+# 用法：workflow_dispatch 的 vless_links 里逐行粘贴 vless:// 链接；
+#      留空则回退到 Secret M7A_PROXY_LINK。
+
+on:
+  workflow_dispatch:
+    inputs:
+      vless_links:
+        description: "VLESS 链接（每行一个；留空用 Secret M7A_PROXY_LINK）"
+        required: false
+        default: ""
+      skip_direct:
+        description: "跳过直连基线（true/false）"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      - name: Prepare links
+        env:
+          INLINE: ${{ github.event.inputs.vless_links }}
+          SECRET_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          : > /tmp/links_raw.txt
+          if [ -n "${INLINE:-}" ]; then
+            printf '%s\n' "$INLINE" >> /tmp/links_raw.txt
+          fi
+          N=$(grep -c 'vless://' /tmp/links_raw.txt 2>/dev/null || echo 0)
+          if [ "${N:-0}" -eq 0 ] && [ -n "${SECRET_LINK:-}" ]; then
+            echo "输入为空，回退到 Secret M7A_PROXY_LINK"
+            printf '%s\n' "$SECRET_LINK" >> /tmp/links_raw.txt
+          fi
+          grep -o 'vless://[^[:space:]]*' /tmp/links_raw.txt 2>/dev/null \
+            | sort -u > /tmp/links.txt || true
+          N=$(grep -c . /tmp/links.txt 2>/dev/null || echo 0)
+          echo "节点数量: ${N:-0}"
+          # 打印时隐去 UUID
+          sed -E 's#(vless://)[^@]+@#\1***@#' /tmp/links.txt | head -n 20
+          # 把链接写进 ::add-mask:: 之外的临时变量供后续标记
+          head -n 5 /tmp/links.txt | sed -E 's#(vless://)[^@]+@#\1***@#' \
+            | awk '{print "::notice::"$0}' || true
+
+      - name: Direct baseline
+        if: github.event.inputs.skip_direct != 'true'
+        run: |
+          set -uo pipefail
+          echo "=== 直连基线 ==="
+          python3 .github/scripts/check_proxy_latency.py 2>&1 \
+            | tee /tmp/screen.log || true
+
+      - name: Screen each node
+        run: |
+          set -uo pipefail
+          [ -f /tmp/screen.log ] || : > /tmp/screen.log
+          i=0
+          while IFS= read -r link; do
+            [ -z "$link" ] && continue
+            i=$((i + 1))
+            tag="${link##*#}"
+            tag=$(printf '%s' "$tag" | head -c 40)
+            masked=$(printf '%s' "$link" | sed -E 's#(vless://)[^@]+@#\1***@#')
+            {
+              echo ""
+              echo "=============================================================="
+              echo "节点 $i: ${tag:-未命名}"
+              echo "  $masked"
+              echo "=============================================================="
+            } | tee -a /tmp/screen.log
+
+            if ! python3 .github/scripts/setup_proxy.py --link "$link" \
+                 --socks-port 10809 --http-port 10810 --keep-alive; then
+              echo "  ❌ 代理启动失败，跳过该节点" | tee -a /tmp/screen.log
+              [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+              continue
+            fi
+
+            echo "--- 经该节点测速 ---" | tee -a /tmp/screen.log
+            python3 .github/scripts/check_proxy_latency.py \
+              --proxy socks5://127.0.0.1:10809 --no-direct 2>&1 \
+              | tee -a /tmp/screen.log || true
+
+            [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+            sleep 2
+          done < /tmp/links.txt
+          echo ""
+          echo "全部节点测试完毕。"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🌐 VLESS 节点延迟筛选"
+            echo
+            echo "判定：20 次 WebSocket 往返总耗时 < 1000ms 才算达标。"
+            echo
+            echo "| 链路 | 结果 |"
+            echo "|---|---|"
+            echo "| 本机直连 | 2/5 达标（rtt 23~102ms） |"
+            echo "| runner 直连 | 0/5 达标（rtt 241~387ms） |"
+            echo "| runner 经 VLESS | 见下 |"
+            echo
+            echo '```'
+            tail -n 80 /tmp/screen.log 2>/dev/null || echo "(无输出)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: vless-screen
+          path: /tmp/screen.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true

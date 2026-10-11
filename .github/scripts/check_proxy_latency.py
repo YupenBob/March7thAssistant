@@ -261,6 +261,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--proxy", help="单个代理，如 socks5://127.0.0.1:1080")
     ap.add_argument("--list", help="代理列表文件，每行一个")
+    ap.add_argument("--no-direct", action="store_true",
+                    help="跳过直连基线（批量测多个代理时省时间）")
     args = ap.parse_args()
 
     log("=" * 86)
@@ -270,7 +272,8 @@ def main():
     log("=" * 86)
 
     reports = []
-    reports.append(eval_proxy("直连（基线）", None))
+    if not args.no_direct:
+        reports.append(eval_proxy("直连（基线）", None))
 
     candidates = []
     if args.proxy:
