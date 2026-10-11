@@ -1,1 +1,1 @@
-https://user.mihoyo.com/login-platform/mobile.html?expire=1791689483&tk=23d6183e-4e42-449b-8c08-06f87b31399b&token_types=4#/login/qr
+https://user.mihoyo.com/login-platform/mobile.html?expire=1791689605&tk=0d07624b-4859-4aa3-a337-ed59911ab2a3&token_types=4#/login/qr
