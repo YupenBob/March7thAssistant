@@ -1,0 +1,325 @@
+name: "M7A 93 · Daily Run (cloud)"
+
+# 目标：每天定时在云端跑完日常/活动，无需人工介入。
+#
+# 登录态来源的两种方式（按优先级）：
+#   1. 仓库 m7a-state 分支里的加密 profile（首选，持久、不会过期丢失）
+#   2. 最近一次 90 号 workflow 产出的 artifact（首次引导用）
+#
+# 每次运行结束都会把刷新后的 profile 重新加密写回分支，
+# 这样登录态随每日运行持续续期。
+#
+# 时间：cron 用 UTC。北京时间 04:00 = 前一天 20:00 UTC。
+# 注意 GitHub 的 schedule 在高峰期会延迟数分钟到数十分钟。
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "要执行的任务（main=完整运行 / daily=仅每日实训 / power=仅清体力）"
+        required: false
+        default: "main"
+      dry_run:
+        description: "只验证登录态与配置，不真正跑任务"
+        required: false
+        default: "false"
+      update_state_branch:
+        description: "是否把刷新后的 profile 写回 m7a-state 分支"
+        required: false
+        default: "true"
+  schedule:
+    # 每天 20:00 UTC = 次日 04:00 北京时间
+    - cron: "0 20 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  # 避免两次运行同时改写 profile 分支导致互相覆盖
+  group: m7a-daily
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-daily
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      # 进入云游戏的排队上限（分钟）。实测云端排队偶发失败，放宽一些。
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cryptography
+        run: pip install --quiet cryptography
+
+      - name: Fetch encrypted profile from state branch
+        id: fetch
+        run: |
+          set -uo pipefail
+          mkdir -p "$STATE_DIR"
+          if git fetch --depth 1 origin "$STATE_BRANCH" 2>/dev/null; then
+            if git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc 2>/dev/null; then
+              SIZE=$(stat -c%s /tmp/m7a_profile.enc)
+              echo "✅ 从 $STATE_BRANCH 分支取得 profile 密文（$SIZE 字节）"
+              echo "source=branch" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "::warning::$STATE_BRANCH 分支暂无密文，回退到 artifact"
+          echo "source=artifact" >> "$GITHUB_OUTPUT"
+
+      - name: Fallback — download latest artifact
+        if: steps.fetch.outputs.source == 'artifact'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+               -o /tmp/arts.json
+          python3 - <<'PY'
+          import json, sys
+          arts = json.load(open("/tmp/arts.json"))["artifacts"]
+          # 取最新的登录态产物（90 号产出）
+          cands = [a for a in arts if a["name"] == "m7a-login-state" and not a["expired"]]
+          if not cands:
+              print("::error::没有可用的登录态产物，请先跑一次 90 号 workflow 完成扫码登录")
+              sys.exit(1)
+          cands.sort(key=lambda a: a["created_at"], reverse=True)
+          best = cands[0]
+          print(f"选中产物 {best['id']} 创建于 {best['created_at']} 来自 run {best['workflow_run']['id']}")
+          open("/tmp/art_id.txt", "w").write(str(best["id"]))
+          PY
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/actions/artifacts/$(cat /tmp/art_id.txt)/zip" \
+               -o /tmp/art.zip
+          mkdir -p /tmp/artwork && cd /tmp/artwork
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/art.zip').extractall('.')"
+          TARBALL="$(find /tmp/artwork -name 'm7a-login-state.tar.gz' | head -n 1)"
+          [ -z "$TARBALL" ] && TARBALL="$(find /tmp/artwork -name '*.tar.gz' | head -n 1)"
+          [ -z "$TARBALL" ] && { echo "::error::产物里没有 tar.gz"; exit 1; }
+          cp "$TARBALL" /tmp/state-from-artifact.tar.gz
+          ls -lh /tmp/state-from-artifact.tar.gz
+
+      - name: Decrypt and unpack profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${M7A_PROFILE_KEY:-}" ]; then
+            echo "::error::Secret M7A_PROFILE_KEY 未设置"
+            exit 1
+          fi
+
+          rm -rf "$STATE_DIR"
+          mkdir -p "$STATE_DIR"
+
+          if [ "${{ steps.fetch.outputs.source }}" = "branch" ]; then
+            python3 .github/scripts/m7a_profile_crypto.py decrypt \
+              /tmp/m7a_profile.enc /tmp/state.tar.gz
+            tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          else
+            tar -xzf /tmp/state-from-artifact.tar.gz -C "$STATE_DIR"
+          fi
+
+          # 归一化 profile 目录名为 Integrated
+          # （cloud.py: BROWSER_INSTALL_PATH/UserProfile/<browser_type.capitalize()>）
+          if [ ! -d "$STATE_DIR/UserProfile/Integrated" ]; then
+            for cand in Integrated Chrome Edge Chromium; do
+              if [ -d "$STATE_DIR/UserProfile/$cand" ]; then
+                mv "$STATE_DIR/UserProfile/$cand" "$STATE_DIR/UserProfile/Integrated" 2>/dev/null || true
+                break
+              fi
+            done
+          fi
+          mkdir -p "$STATE_DIR/UserProfile" "$STATE_DIR/logs" "$STATE_DIR/settings"
+          chmod -R 0777 "$STATE_DIR" 2>/dev/null || true
+
+          echo "=== profile 关键文件 ==="
+          P="$STATE_DIR/UserProfile/Integrated"
+          for f in "Default/Cookies" "Default/Preferences" "Default/Local Storage"; do
+            if [ -e "$P/$f" ]; then echo "  ✅ $f"; else echo "  ❌ $f"; fi
+          done
+          echo "=== 体积 ==="
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+
+      - name: Prepare config
+        run: |
+          set -euo pipefail
+          if [ ! -f "$STATE_DIR/config.yaml" ]; then
+            cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          fi
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          # Loop：任务跑完后不退出，便于容器内循环等待下次（本 workflow 每次只跑一轮）
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish|cloud_game_max_queue_time):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Start container and run task
+        run: |
+          set -euo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          TASK="${{ github.event.inputs.task }}"
+          [ -z "$TASK" ] && TASK="main"
+          echo "本次任务: $TASK"
+          docker run -d \
+            --name "$CNAME" \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=INFO \
+            "$IMAGE" python main.py $TASK
+          sleep 5
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Wait for task to finish
+        id: run
+        run: |
+          set -uo pipefail
+          MAX=$(( 100 * 60 ))
+          deadline=$(( $(date +%s) + MAX ))
+          result=running
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+
+            # 未登录 = 登录态失效，需要重新扫码
+            if grep -qE "请使用手机米游社 APP 扫描|等待扫码" /tmp/m7a.log 2>/dev/null; then
+              result=needs_qr; break
+            fi
+            # 任务跑完
+            if grep -qE "任务完成|完成，共|全部完成|每日实训完成|流程结束" /tmp/m7a.log 2>/dev/null; then
+              result=task_done; break
+            fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              EXIT=$(docker inspect "$CNAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo '?')
+              if grep -qE "云游戏剩余时长：|检测到登录成功" /tmp/m7a.log 2>/dev/null; then
+                result=logged_in_exited
+              else
+                result=exited_early
+              fi
+              echo "容器退出，exit=$EXIT"
+              break
+            fi
+            sleep 15
+          done
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "=== 结果: $result ==="
+          grep -E "云游戏剩余时长|检测到登录成功|任务|完成" /tmp/m7a.log 2>/dev/null | tail -n 30 || true
+          echo "=== 日志尾部 ==="
+          tail -n 60 /tmp/m7a.log || true
+
+      - name: Report
+        if: always()
+        run: |
+          set -uo pipefail
+          R="${{ steps.run.outputs.result }}"
+          {
+            echo "## 🎮 M7A 云端日常运行"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 结果 | \`$R\` |"
+            echo "| 任务 | \`${{ github.event.inputs.task || 'main' }}\` |"
+            echo "| 登录态来源 | ${{ steps.fetch.outputs.source }} |"
+            echo "| runner | ${{ runner.name }} |"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo "| 时间 | $(date -u +%FT%TZ) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$R" in
+            task_done)         echo "✅ **任务完成**" >> "$GITHUB_STEP_SUMMARY" ;;
+            logged_in_exited)  echo "⚠️ 已登录但容器提前退出，见日志" >> "$GITHUB_STEP_SUMMARY" ;;
+            needs_qr)          echo "❌ **登录态失效**，需要重新扫码（跑 90 号 workflow）" >> "$GITHUB_STEP_SUMMARY" ;;
+            exited_early)      echo "⚠️ 容器未登录即退出，见日志" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)                 echo "⏳ 超时未判定" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+      - name: Save refreshed profile back to state branch
+        if: always()
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          docker logs "$CNAME" > "$STATE_DIR/logs/container.log" 2>&1 || true
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+
+          # 容器以 root 运行 → 放开权限，否则 runner 用户读不了
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c \
+            'chmod -R a+rwX /s 2>/dev/null || true' || true
+
+          if [ "${{ github.event.inputs.update_state_branch }}" = "false" ]; then
+            echo "按输入要求跳过写回分支"
+            exit 0
+          fi
+          if [ ! -d "$STATE_DIR/UserProfile/Integrated" ]; then
+            echo "::warning::没有 profile 可写回"
+            exit 0
+          fi
+
+          tar -czf /tmp/state.tar.gz -C "$STATE_DIR" UserProfile settings config.yaml
+          ls -lh /tmp/state.tar.gz
+          python3 .github/scripts/m7a_profile_crypto.py encrypt \
+            /tmp/state.tar.gz /tmp/m7a_profile.enc || { echo "::error::加密失败"; exit 1; }
+
+          # 用 API 写回分支，避免在 workspace 里搞 git 状态
+          cd /tmp
+          rm -rf state-repo && mkdir state-repo && cd state-repo
+          git init -q
+          git remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch -q origin "$STATE_BRANCH" 2>/dev/null || true
+          if git show-ref -q "refs/remotes/origin/$STATE_BRANCH"; then
+            git checkout -q -B "$STATE_BRANCH" "origin/$STATE_BRANCH"
+          else
+            git checkout -q --orphan "$STATE_BRANCH"
+          fi
+          cp /tmp/m7a_profile.enc "$ENC_PATH"
+          date -u +%FT%TZ > updated_at.txt
+          git add -A
+          if git diff --cached --quiet; then
+            echo "profile 无变化，跳过写回"
+          else
+            git commit -q -m "state update $(date -u +%FT%TZ)"
+            set +e
+            OUT="$(git push origin "$STATE_BRANCH" 2>&1)"; RC=$?
+            set -e
+            if [ "$RC" -ne 0 ]; then echo "::error::写回分支失败"; echo "$OUT"; exit "$RC"; fi
+            echo "✅ 已写回 $STATE_BRANCH 分支"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: m7a-daily-log
+          path: /tmp/m7a.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
