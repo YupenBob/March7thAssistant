@@ -27,6 +27,10 @@ on:
         description: "是否把刷新后的 profile 写回 m7a-state 分支"
         required: false
         default: "true"
+      max_attempts:
+        description: "最多尝试次数（跨境链路偶发失败，重试可显著提高成功率）"
+        required: false
+        default: "3"
   schedule:
     # 每天 20:00 UTC = 次日 04:00 北京时间
     - cron: "0 20 * * *"
@@ -42,7 +46,7 @@ concurrency:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     env:
       IMAGE: ghcr.io/moesnow/march7thassistant:latest
@@ -173,63 +177,98 @@ jobs:
       - name: Pull image
         run: docker pull "$IMAGE"
 
-      - name: Start container and run task
-        run: |
-          set -euo pipefail
-          docker rm -f "$CNAME" 2>/dev/null || true
-          TASK="${{ github.event.inputs.task }}"
-          [ -z "$TASK" ] && TASK="main"
-          echo "本次任务: $TASK"
-          docker run -d \
-            --name "$CNAME" \
-            --shm-size=2g \
-            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
-            -v "$STATE_DIR/logs":/m7a/logs \
-            -v "$STATE_DIR/settings":/m7a/settings \
-            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
-            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
-            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
-            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
-            -e MARCH7TH_LOG_LEVEL=INFO \
-            "$IMAGE" python main.py $TASK
-          sleep 5
-          docker ps -a --filter "name=$CNAME"
-
-      - name: Wait for task to finish
+      - name: Run task with retries
         id: run
         run: |
           set -uo pipefail
-          MAX=$(( 100 * 60 ))
-          deadline=$(( $(date +%s) + MAX ))
-          result=running
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+          TASK="${{ github.event.inputs.task }}"
+          [ -z "$TASK" ] && TASK="main"
+          MAX_ATTEMPTS="${{ github.event.inputs.max_attempts }}"
+          [ -z "$MAX_ATTEMPTS" ] && MAX_ATTEMPTS=3
+          echo "任务=$TASK  最多尝试 $MAX_ATTEMPTS 次"
 
-            # 未登录 = 登录态失效，需要重新扫码
-            if grep -qE "请使用手机米游社 APP 扫描|等待扫码" /tmp/m7a.log 2>/dev/null; then
-              result=needs_qr; break
-            fi
-            # 任务跑完
-            if grep -qE "任务完成|完成，共|全部完成|每日实训完成|流程结束" /tmp/m7a.log 2>/dev/null; then
-              result=task_done; break
-            fi
-            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
-              EXIT=$(docker inspect "$CNAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo '?')
-              if grep -qE "云游戏剩余时长：|检测到登录成功" /tmp/m7a.log 2>/dev/null; then
-                result=logged_in_exited
-              else
-                result=exited_early
+          # 实测：跨境链路质量差，页面加载与进入游戏都会偶发网络错误
+          # （ERR_TIMED_OUT、页面弹出「网络错误」）。这类失败重启容器后
+          # 往往就能过，所以在这里做容器级重试。
+          # 注意：needs_qr 表示登录态失效，重试无意义，立即停止。
+          result=pending
+          attempt=0
+          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+            attempt=$(( attempt + 1 ))
+            echo ""
+            echo "############ 第 $attempt / $MAX_ATTEMPTS 次尝试 ############"
+
+            docker rm -f "$CNAME" >/dev/null 2>&1 || true
+            # 每次尝试前清掉上一轮的日志，避免误判
+            : > /tmp/m7a.log
+
+            docker run -d \
+              --name "$CNAME" \
+              --shm-size=2g \
+              -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+              -v "$STATE_DIR/logs":/m7a/logs \
+              -v "$STATE_DIR/settings":/m7a/settings \
+              -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+              -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+              -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+              -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+              -e MARCH7TH_LOG_LEVEL=INFO \
+              "$IMAGE" python main.py $TASK >/dev/null
+            sleep 5
+
+            # 单次尝试上限：正常完整运行约 20-40 分钟
+            deadline=$(( $(date +%s) + 60 * 60 ))
+            result=running
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
+
+              if grep -qE "请使用手机米游社 APP 扫描|等待扫码" /tmp/m7a.log 2>/dev/null; then
+                result=needs_qr; break
               fi
-              echo "容器退出，exit=$EXIT"
+              if grep -qE "任务完成|完成，共|全部完成|每日实训完成|流程结束|已完成全部" /tmp/m7a.log 2>/dev/null; then
+                result=task_done; break
+              fi
+              if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+                EXIT=$(docker inspect "$CNAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo '?')
+                echo "容器退出，exit=$EXIT"
+                if grep -qE "云游戏剩余时长：|检测到登录成功" /tmp/m7a.log 2>/dev/null; then
+                  result=logged_in_exited
+                else
+                  result=exited_early
+                fi
+                break
+              fi
+              sleep 15
+            done
+            [ "$result" = "running" ] && result=timeout
+
+            echo "第 $attempt 次结果: $result"
+            echo "--- 本次尝试的关键行 ---"
+            grep -E "云游戏剩余时长|检测到登录成功|网络错误|网络异常|页面加载失败|进入云游戏|排队" /tmp/m7a.log 2>/dev/null | tail -n 15 || true
+
+            # 成功，或登录态失效（重试无意义），直接结束
+            if [ "$result" = "task_done" ]; then break; fi
+            if [ "$result" = "needs_qr" ]; then
+              echo "::warning::登录态失效，重试无意义，停止"
               break
             fi
-            sleep 15
+
+            # 保存本轮日志备查
+            cp /tmp/m7a.log "/tmp/attempt_${attempt}.log" 2>/dev/null || true
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              BACKOFF=$(( attempt * 60 ))
+              echo "::warning::第 $attempt 次失败（$result），${BACKOFF}s 后重试"
+              sleep "$BACKOFF"
+            fi
           done
+
+          # 汇总所有尝试的日志
+          cat /tmp/attempt_*.log > /tmp/m7a-all.log 2>/dev/null || cp /tmp/m7a.log /tmp/m7a-all.log
+          echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
           echo "result=$result" >> "$GITHUB_OUTPUT"
-          echo "=== 结果: $result ==="
-          grep -E "云游戏剩余时长|检测到登录成功|任务|完成" /tmp/m7a.log 2>/dev/null | tail -n 30 || true
-          echo "=== 日志尾部 ==="
-          tail -n 60 /tmp/m7a.log || true
+          echo ""
+          echo "=== 最终结果: $result（共 $attempt 次尝试）==="
 
       - name: Report
         if: always()
@@ -241,7 +280,7 @@ jobs:
             echo
             echo "| 项 | 值 |"
             echo "|---|---|"
-            echo "| 结果 | \`$R\` |"
+            echo "| 结果 | \`$R\`（尝试 ${{ steps.run.outputs.attempts }} 次） |"
             echo "| 任务 | \`${{ github.event.inputs.task || 'main' }}\` |"
             echo "| 登录态来源 | ${{ steps.fetch.outputs.source }} |"
             echo "| runner | ${{ runner.name }} |"
@@ -319,7 +358,9 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: m7a-daily-log
-          path: /tmp/m7a.log
+          path: |
+            /tmp/m7a-all.log
+            /tmp/attempt_*.log
           if-no-files-found: warn
           retention-days: 7
           overwrite: true

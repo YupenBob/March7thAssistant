@@ -1,0 +1,86 @@
+name: "M7A 95 · Daily Catch-up"
+
+# 目的：给每日任务兜底。
+#
+# 93 号已有容器级重试（同一 job 内最多 3 次），能覆盖网络抖动。
+# 但如果整个 job 失败（runner 异常、镜像拉取失败、超时等），当天就没人管了。
+# 本 workflow 在稍晚的时间点检查最近一次 93 号运行的结果：
+#   - 仍在进行中 → 不干预
+#   - 已成功     → 无需补跑
+#   - 失败/缺失  → 补跑一次
+#
+# 时间：北京时间 10:30（= 02:30 UTC），给凌晨 04:00 那次留出充足的失败时间。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: m7a-daily
+  cancel-in-progress: false
+
+jobs:
+  catchup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check last daily run
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/93.daily_run.yml/runs?per_page=10" \
+               -o /tmp/runs.json
+          echo "=== 最近 93 号运行 ==="
+          python3 .github/scripts/catchup_verdict.py --list-only
+          python3 .github/scripts/catchup_verdict.py > /tmp/verdict.txt
+          cat /tmp/verdict.txt
+          VERDICT="$(tail -n 1 /tmp/verdict.txt | tr -d '[:space:]')"
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "结论: $VERDICT"
+
+      - name: Trigger catch-up run
+        if: steps.check.outputs.verdict == 'needs_catchup' || steps.check.outputs.verdict == 'missing'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "触发补跑..."
+          curl -sSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/93.daily_run.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"task":"main","max_attempts":"3"}}' \
+            -o /tmp/dispatch.out -w "HTTP %{http_code}\n"
+          echo "补跑已触发"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          V="${{ steps.check.outputs.verdict }}"
+          {
+            echo "## 🔁 每日任务兜底检查"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 检查结论 | \`$V\` |"
+            echo "| 检查时间 | $(date -u +%FT%TZ) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$V" in
+            ok)            echo "✅ 最近的每日任务已成功，无需补跑。" >> "$GITHUB_STEP_SUMMARY" ;;
+            in_progress)   echo "⏳ 每日任务仍在进行中，不重复触发。" >> "$GITHUB_STEP_SUMMARY" ;;
+            needs_catchup) echo "🔁 最近一次未成功，已触发补跑。" >> "$GITHUB_STEP_SUMMARY" ;;
+            missing)       echo "🔁 窗口内没有运行记录（cron 可能未触发），已触发补跑。" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)             echo "⚠️ 未能判定（$V），未做任何操作。" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
