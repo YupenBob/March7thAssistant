@@ -1,0 +1,236 @@
+name: "M7A 97 · Record Cloud Entry"
+
+# 目的：录屏记录「进入云游戏」的全过程，并抓出失败的那个请求。
+#
+# 背景：之前只能靠 DOM 截图与日志推断，看不到点击后到底发生了什么。
+#       本 workflow 用 CDP 逐帧截图 + performance 日志抓网络，
+#       最后用 ffmpeg 拼成 mp4，便于直观查看。
+#
+# 产物：video.mp4（录屏）、network.json（所有请求与失败原因）、console.log、frames/
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: "是否同时挂代理（验证代理对进游戏的影响）"
+        required: false
+        default: "false"
+      no_refresh:
+        description: "跳过点击前的刷新（对比是否刷新导致的）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-record
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: |
+          pip install --quiet cryptography requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg || true
+          ffmpeg -version 2>/dev/null | head -n 1 || echo "ffmpeg 不可用"
+
+      - name: Setup proxy (optional)
+        if: github.event.inputs.use_proxy == 'true'
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 --keep-alive || {
+              echo "::error::代理建立失败"; exit 1; }
+          curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org; echo
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+          mkdir -p "$STATE_DIR/logs"
+
+      - name: Prepare config
+        env:
+          USE_PROXY: ${{ github.event.inputs.use_proxy }}
+        run: |
+          set -euo pipefail
+          [ -f "$STATE_DIR/config.yaml" ] || cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" "$USE_PROXY" <<'PY'
+          import re, sys
+          path, timeout, use_proxy = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          arg = '[]'
+          if use_proxy == 'true':
+              arg = '["--proxy-server=socks5://127.0.0.1:10809", "--proxy-bypass-list=<-loopback>"]'
+          if re.search(r'^browser_launch_argument:.*$', text, flags=re.M):
+              text = re.sub(r'^browser_launch_argument:.*$',
+                            f'browser_launch_argument: {arg}', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish|browser_launch_argument):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run recorder
+        env:
+          M7A_NO_REFRESH: ${{ github.event.inputs.no_refresh == 'true' && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          NETARG=""
+          if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then NETARG="--network host"; fi
+          docker run -d \
+            --name "$CNAME" \
+            $NETARG \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_record.py":/m7a/diag_record.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=DEBUG \
+            -e M7A_NO_REFRESH="$M7A_NO_REFRESH" \
+            "$IMAGE" python diag_record.py
+          sleep 5
+          docker ps -a --filter "name=$CNAME"
+
+      - name: Wait and collect
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1200 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/record.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/record.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/record.log 2>&1 || true
+          docker stop "$CNAME" || true
+          docker rm "$CNAME" || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+          echo "=== 录制输出 ==="
+          tail -n 120 /tmp/record.log
+
+      - name: Make video from frames
+        if: always()
+        run: |
+          set -uo pipefail
+          FR="/tmp/m7a-state/logs/diag/frames"
+          if [ -d "$FR" ]; then
+            N=$(find "$FR" -name '*.png' | wc -l)
+            echo "帧数: $N"
+            if command -v ffmpeg >/dev/null 2>&1 && [ "$N" -gt 0 ]; then
+              # 帧是按抓取顺序命名的，直接用序号序列；帧率低以便看清
+              ffmpeg -y -framerate 2 -pattern_type glob -i "$FR/*.png" \
+                -c:v libx264 -pix_fmt yuv420p -vf "scale=1280:-2" \
+                /tmp/m7a-state/logs/diag/video.mp4 2>&1 | tail -n 5 || \
+                echo "::warning::ffmpeg 合成失败"
+              ls -lh /tmp/m7a-state/logs/diag/video.mp4 2>/dev/null || true
+            else
+              echo "::warning::没有 ffmpeg 或没有帧"
+            fi
+          else
+            echo "::warning::没有 frames 目录"
+          fi
+
+      - name: Network summary
+        if: always()
+        run: |
+          set -uo pipefail
+          NJ="/tmp/m7a-state/logs/diag/network.json"
+          {
+            echo "## 🎥 进入云游戏录屏诊断"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 录屏 | $( [ -f /tmp/m7a-state/logs/diag/video.mp4 ] && echo 'video.mp4' || echo '无' ) |"
+            echo "| 帧数 | $(find /tmp/m7a-state/logs/diag/frames -name '*.png' 2>/dev/null | wc -l) |"
+            echo "| 网络请求 | $(python3 -c "import json;print(len(json.load(open('$NJ'))))" 2>/dev/null || echo '?') |"
+            echo "| 代理 | ${{ github.event.inputs.use_proxy }} |"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$NJ" ]; then
+            echo "### 失败或异常的请求" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            python3 - "$NJ" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          bad = [r for r in data
+                 if r.get("error") or (r.get("status") and int(r["status"]) >= 400)]
+          if not bad:
+              print("(没有失败请求)")
+          for r in bad[:60]:
+              print(f"[{r.get('status') or r.get('error')}] {str(r.get('url'))[:150]}")
+          PY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### 云游戏相关请求"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            python3 - "$NJ" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          keys = ("cloudgame", "cg-hkrpg", "dispatch", "wallet", "mhystatic", "wss")
+          hit = [r for r in data if any(k in str(r.get("url")) for k in keys)]
+          if not hit:
+              print("(没有匹配的请求)")
+          for r in hit[:60]:
+              print(f"[{r.get('status') or r.get('error') or '?'}] {str(r.get('url'))[:150]}")
+          PY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+          echo done
+
+      - name: Upload recording
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: cloud-entry-recording
+          path: |
+            /tmp/record.log
+            /tmp/m7a-state/logs/diag/video.mp4
+            /tmp/m7a-state/logs/diag/network.json
+            /tmp/m7a-state/logs/diag/console.log
+            /tmp/m7a-state/logs/diag/frames
+            /tmp/xray/xray.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
