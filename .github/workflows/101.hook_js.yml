@@ -1,0 +1,176 @@
+name: "M7A 101 · Hook Page JS"
+
+# 目的：看清页面 JS 为什么在 getNodesInfo 成功后不发出 paasDispatch。
+#
+# 已确认：dispatcher 流程走到 getNodesInfo 200 后即中断，
+# paasDispatch（真正分配节点、返回串流地址的调用）从未发出，
+# 页面直接弹通用「网络错误」。
+#
+# 本 workflow 注入 JS 钩子，包住 XMLHttpRequest / WebSocket /
+# RTCPeerConnection，记录完整往返与状态变化，并捕获页面自身报错，
+# 用于判断是"SDK 内部判定环境不合格"还是"某个请求静默失败"。
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: "是否挂代理（对比代理下钩子输出）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  hook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-hook
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet cryptography requests
+
+      - name: Setup proxy (optional)
+        if: github.event.inputs.use_proxy == 'true'
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 --keep-alive || exit 1
+          curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org; echo
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          mkdir -p "$STATE_DIR/logs"
+
+      - name: Prepare config
+        env:
+          USE_PROXY: ${{ github.event.inputs.use_proxy }}
+        run: |
+          set -euo pipefail
+          [ -f "$STATE_DIR/config.yaml" ] || cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" "$USE_PROXY" <<'PY'
+          import json, re, sys
+          path, timeout, use_proxy = sys.argv[1:4]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          args = []
+          if use_proxy == 'true':
+              args = ["--proxy-server=socks5://127.0.0.1:10809",
+                      "--proxy-bypass-list=<-loopback>"]
+          val = json.dumps(args)
+          if re.search(r'^browser_launch_argument:.*$', text, flags=re.M):
+              text = re.sub(r'^browser_launch_argument:.*$',
+                            f'browser_launch_argument: {val}', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(browser_launch_argument|after_finish):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run hook diagnostic
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          NETARG=""
+          if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then NETARG="--network host"; fi
+          docker run -d \
+            --name "$CNAME" \
+            $NETARG \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_hook.py":/m7a/diag_hook.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=INFO \
+            "$IMAGE" python diag_hook.py
+          sleep 5
+
+      - name: Collect
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1500 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/hook.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/hook.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/hook.log 2>&1 || true
+          echo "=== 钩子输出 ==="
+          cat /tmp/hook.log | tail -n 220
+          docker stop "$CNAME" 2>/dev/null || true
+          docker rm "$CNAME" 2>/dev/null || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+          find "$STATE_DIR/logs/diag3" -type f -printf '%10s  %p\n' 2>/dev/null || true
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🪝 页面 JS 钩子诊断"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 代理 | ${{ github.event.inputs.use_proxy }} |"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo
+            echo "### 钩子记录的关键往返"
+            echo '```'
+            grep -E "\[(xhr_done|ws_|rtc_|xhr_error|xhr_timeout)\]" /tmp/hook.log 2>/dev/null | tail -n 50 || echo "(无)"
+            echo '```'
+            echo "### JS 错误"
+            echo '```'
+            grep -A1 "JS 错误" /tmp/hook.log 2>/dev/null | tail -n 30 || echo "(无)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: hook-diag
+          path: |
+            /tmp/hook.log
+            /tmp/m7a-state/logs/diag3
+            /tmp/xray/xray.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
