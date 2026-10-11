@@ -102,10 +102,50 @@ def main():
     if not ok:
         return 1
 
-    dump_state(controller.driver, "01_after_start")
-
-    # 复现 _click_enter_game 的逻辑，但每一步都记录状态
     driver = controller.driver
+    dump_state(driver, "01_after_start")
+
+    # 复现应用启动时会做的关键动作，否则页面状态与正式运行不可比：
+    #   _load_initial_local_storage() 注入云游戏所需的 localStorage
+    print("\n>>> 注入 initial_local_storage", flush=True)
+    try:
+        loaded = controller._load_initial_local_storage()
+        print(f">>> _load_initial_local_storage -> {loaded}", flush=True)
+    except Exception:
+        traceback.print_exc()
+    dump_state(driver, "02_after_localstorage")
+
+    # 用应用自己的判定逻辑问"现在算登录了吗"
+    print("\n>>> 调用应用自身的登录判定 _check_login()", flush=True)
+    try:
+        logged = controller._check_login(timeout=15)
+        print(f">>> _check_login -> {logged}", flush=True)
+    except Exception:
+        traceback.print_exc()
+        logged = None
+    dump_state(driver, "03_login_check")
+
+    # 刷新一次再看（页面可能异步初始化）
+    print("\n>>> 刷新页面后再判定一次", flush=True)
+    try:
+        driver.refresh()
+        time.sleep(8)
+    except Exception:
+        traceback.print_exc()
+    dump_state(driver, "04_after_refresh")
+    try:
+        logged2 = controller._check_login(timeout=15)
+        print(f">>> 刷新后 _check_login -> {logged2}", flush=True)
+    except Exception:
+        traceback.print_exc()
+    dump_state(driver, "05_login_check2")
+
+    # 如果登录判定为真，才继续复现进入游戏的点击
+    if not logged and not logged2:
+        print("\n>>> 判定为未登录，跳过进入游戏复现（避免误判）", flush=True)
+        print(">>> 诊断完成，产物在 /m7a/logs/diag", flush=True)
+        return 0
+
     try:
         from selenium.webdriver.common.by import By
         guide = driver.find_elements(By.CSS_SELECTOR, "div.guide-close-btn__x")
@@ -113,18 +153,16 @@ def main():
             print(">>> 关闭引导弹窗", flush=True)
             driver.execute_script("arguments[0].click();", guide[0])
             time.sleep(1)
-        dump_state(driver, "02_after_guide_close")
-
         btn = driver.find_elements(By.CSS_SELECTOR, "div.wel-card__content--start")
         print(f">>> 找到进入按钮 {len(btn)} 个", flush=True)
         if btn:
             driver.execute_script("arguments[0].click();", btn[0])
             print(">>> 已点击进入游戏", flush=True)
-            for i in (2, 5, 10, 20):
-                time.sleep(i if i == 2 else i - 2)
-                dump_state(driver, f"03_after_click_{i}s")
+            for i in (3, 8, 15, 25):
+                time.sleep(3 if i == 3 else 5)
+                dump_state(driver, f"06_after_click_{i}s")
         else:
-            dump_state(driver, "03_no_button")
+            dump_state(driver, "06_no_button")
     except Exception:
         traceback.print_exc()
         dump_state(driver, "99_exception")
