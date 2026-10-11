@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       login_wait_minutes:
-        description: "等待扫码的分钟数（须小于容器内登录超时，默认 22 < 25）"
+        description: "扫码窗口分钟数（给足时间，程序会自动刷新二维码）"
         required: false
-        default: "22"
+        default: "24"
       keep_days:
         description: "产物保留天数"
         required: false
@@ -49,8 +49,12 @@ jobs:
           chmod -R 0777 "$STATE_DIR"
 
           # 用官方示例配置打底，生成容器用的 config.yaml。
-          # 镜像本身不带 config.yaml（Dockerfile 里删掉了），缺失时会静默套用内置默认值，
-          # 这里显式提供以便调长登录超时、并把任务跑完后置为退出。
+          # 镜像本身不带 config.yaml（Dockerfile 里删掉了），缺失时会静默套用内置默认值。
+          #
+          # 关键：after_finish 必须是 Loop，不能是 Exit。
+          # tasks/game/__init__.py:271-276 里，非 Loop 会走 shutdown()+sys.exit(0)，
+          # 进程在登录超时后直接退出 → 容器死亡 → 用户扫码时浏览器早没了。
+          # Loop 则让进程保活并等待下一个定时点，二维码可持续刷新。
           cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
 
           if command -v python3 >/dev/null 2>&1; then
@@ -61,12 +65,12 @@ jobs:
           text = re.sub(r'^cloud_game_login_timeout:.*$',
                         f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
           text = re.sub(r'^after_finish:.*$',
-                        'after_finish: Exit', text, count=1, flags=re.M)
+                        'after_finish: Loop', text, count=1, flags=re.M)
           open(path, "w", encoding="utf-8").write(text)
           PY
           else
             sed -i "s/^cloud_game_login_timeout:.*/cloud_game_login_timeout: $LOGIN_TIMEOUT_MIN/" "$STATE_DIR/config.yaml"
-            sed -i "s/^after_finish:.*/after_finish: Exit/" "$STATE_DIR/config.yaml"
+            sed -i "s/^after_finish:.*/after_finish: Loop/" "$STATE_DIR/config.yaml"
           fi
 
           echo "--- 生效的关键配置 ---"
@@ -111,7 +115,6 @@ jobs:
             -e MARCH7TH_CLOUD_GAME_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
             -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
-            -e MARCH7TH_AFTER_FINISH=Exit \
             -e MARCH7TH_LOG_LEVEL=DEBUG \
             "$IMAGE"
           sleep 3
@@ -159,7 +162,6 @@ jobs:
               -e MARCH7TH_CLOUD_GAME_ENABLE=true \
               -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
               -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
-              -e MARCH7TH_AFTER_FINISH=Exit \
               -e MARCH7TH_LOG_LEVEL=DEBUG \
               "$IMAGE" >/dev/null
             sleep 8
@@ -237,20 +239,24 @@ jobs:
         run: |
           set -uo pipefail
           WAIT="${{ github.event.inputs.login_wait_minutes }}"
-          # 硬上限：容器内登录超时是 25 分钟，等待窗不能超过它
-          if [ "$WAIT" -gt 24 ]; then echo "::warning::等待窗被限制为 24 分钟（容器内超时 25 分钟）"; WAIT=24; fi
-          echo "给你 $WAIT 分钟扫码。二维码链接会持续刷新到本次运行的 Summary。"
+          echo "扫码窗口 ${WAIT} 分钟。二维码会持续刷新并写入本次运行的 Summary。"
           deadline=$(( $(date +%s) + WAIT * 60 ))
           logged_in=no
-          peak=0
+          last_qr=""
+          restarts=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
 
-            # 二维码会过期，程序会自动刷新。把最新的链接实时写进 Summary，
-            # 这样你随时打开看到的都是当前有效的那个。
+            # 1) 登录成功 → 立刻收工
+            if grep -qE "检测到登录成功|进入云游戏成功" /tmp/m7a.log 2>/dev/null; then
+              logged_in=yes; echo "✅ 检测到登录成功"; break
+            fi
+
+            # 2) 二维码会自动过期并刷新，把最新那个实时写进 Summary。
+            #    这样用户任何时候打开页面看到的都是当前有效的码。
             cur=$(grep -oE 'https://user\.mihoyo\.com/login-platform/[^[:space:]]+' /tmp/m7a.log 2>/dev/null | tail -n 1)
-            if [ -n "$cur" ] && [ "$cur" != "$peak" ]; then
-              peak="$cur"
+            if [ -n "$cur" ] && [ "$cur" != "$last_qr" ]; then
+              last_qr="$cur"
               {
                 echo "## 🔑 当前有效二维码（$(date -u +%H:%M:%SZ) 更新）"
                 echo
@@ -259,23 +265,32 @@ jobs:
                 echo '```'
                 echo "$cur"
                 echo '```'
-              } > /tmp/qr_summary.md
-              cat /tmp/qr_summary.md >> "$GITHUB_STEP_SUMMARY"
-              echo "新二维码: $cur"
+                echo
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "--- 新二维码 $(date -u +%H:%M:%SZ) ---"
+              echo "$cur"
             fi
 
-            if grep -qE "检测到登录成功|进入云游戏成功" /tmp/m7a.log 2>/dev/null; then
-              logged_in=yes; echo "✅ 检测到登录成功"; break
-            fi
+            # 3) 程序侧登录超时不再终止等待 —— after_finish=Loop 会让它进入下一轮，
+            #    并弹出新的二维码。这里只记一笔，继续等。
             if grep -qE "等待云游戏登录超时" /tmp/m7a.log 2>/dev/null; then
-              logged_in=timeout; echo "⏰ 程序侧登录超时"; break
+              if [ "$logged_in" != "timeout_seen" ]; then
+                logged_in=timeout_seen
+                echo "⏰ 程序侧一轮登录超时，等待下一轮新二维码（继续等）"
+              fi
             fi
+
+            # 4) 容器真的死了才退出
             if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
-              echo "容器已退出"; break
+              restarts=$(( restarts + 1 ))
+              echo "::warning::容器已退出（第 $restarts 次）"
+              break
             fi
             sleep 10
           done
-          echo "logged_in=$logged_in"
+          echo "logged_in=$logged_in  restarts=$restarts"
+          echo "logged_in=$logged_in" >> "$GITHUB_OUTPUT"
+          echo "=== 日志尾部 ==="
           tail -n 80 /tmp/m7a.log || true
           echo "logged_in=$logged_in" >> "$GITHUB_OUTPUT"
 
@@ -287,20 +302,9 @@ jobs:
             echo "已登录，跳过。"
             exit 0
           fi
-          # 没人扫码时，等程序自己走到「等待云游戏登录超时」干净收尾。
-          # 注意：这个超时从"进入登录流程"起算，比本 job 的时钟晚很多，
-          # 所以这里给 8 分钟余量，超时也不再等待。
-          deadline=$(( $(date +%s) + 480 ))
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            docker logs "$CNAME" > /tmp/m7a.log 2>&1 || true
-            if grep -qE "等待云游戏登录超时" /tmp/m7a.log 2>/dev/null; then
-              echo "程序已按预期走到登录超时。"; break
-            fi
-            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
-              echo "容器已退出。"; break
-            fi
-            sleep 10
-          done
+          # 没登录成功就把容器停掉，不必再等。
+          # after_finish=Loop 会让程序一直保活，等下去没有意义。
+          echo "未检测到登录成功，直接收尾并导出当前状态。"
           tail -n 40 /tmp/m7a.log || true
 
       - name: Stop container
