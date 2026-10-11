@@ -1,0 +1,96 @@
+name: "M7A 103 · Screen Proxy Latency"
+
+# 目的：批量筛选候选代理，看它们到云游戏测速节点的 RTT 能否满足 SDK 要求。
+#
+# 判定标准（从 cg-sdk bundle 读出的机制）：
+#   WebSocketRttTester.testRttMs(20, 1000)
+#   -> 20 次 WebSocket 往返总耗时必须 < 1000ms，否则该节点 rtt = -1
+#   -> 页面过滤 rtt < 0，全为 -1 时 ping_results 为空
+#   -> getNodesInfo 返回 retcode -110005「游戏服务器连接中断」
+#
+# 实测基线：
+#   用户本机    rtt 23~102ms  20 次 679~2902ms  -> 2/5 达标
+#   GHA runner  rtt 241~387ms 20 次 5901~10700ms -> 0/5 达标
+#
+# 用法：把候选代理逐行填到仓库分支 m7a-state 的 proxies.txt（每行一个
+# scheme://host:port），或用 Secret M7A_PROXY_LIST 提供。
+
+on:
+  workflow_dispatch:
+    inputs:
+      inline_list:
+        description: "直接粘贴候选代理（每行一个 scheme://host:port）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      - name: Prepare candidate list
+        env:
+          INLINE: ${{ github.event.inputs.inline_list }}
+          SECRET_LIST: ${{ secrets.M7A_PROXY_LIST }}
+        run: |
+          set -uo pipefail
+          : > /tmp/proxies.txt
+          if [ -n "${INLINE:-}" ]; then
+            printf '%s\n' "$INLINE" | grep -E '^(socks5?|https?)://' >> /tmp/proxies.txt || true
+          fi
+          if [ -n "${SECRET_LIST:-}" ]; then
+            printf '%s\n' "$SECRET_LIST" | grep -E '^(socks5?|https?)://' >> /tmp/proxies.txt || true
+          fi
+          # 也尝试从状态分支读取
+          if git fetch --depth 1 origin m7a-state 2>/dev/null; then
+            git show FETCH_HEAD:proxies.txt 2>/dev/null >> /tmp/proxies.txt || true
+          fi
+          sort -u /tmp/proxies.txt -o /tmp/proxies.txt || true
+          N=$(grep -c . /tmp/proxies.txt 2>/dev/null || echo 0)
+          echo "候选数量: $N"
+          if [ "$N" -gt 0 ]; then
+            sed 's#://[^@]*@#://***@#' /tmp/proxies.txt | head -n 20
+          fi
+
+      - name: Screen candidates
+        run: |
+          set -uo pipefail
+          echo "=== 直连基线 + 候选筛选 ==="
+          python3 .github/scripts/check_proxy_latency.py --list /tmp/proxies.txt 2>&1 | tee /tmp/screen.log || true
+          echo ""
+          echo "=== 结果摘要 ==="
+          tail -n 25 /tmp/screen.log
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🔍 代理延迟筛选"
+            echo
+            echo "判定：20 次 WebSocket 往返总耗时 < 1000ms 才算达标。"
+            echo
+            echo '```'
+            cat /tmp/screen.log 2>/dev/null | tail -n 60 || echo "(无输出)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: proxy-screen
+          path: /tmp/screen.log
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
