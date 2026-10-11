@@ -1,0 +1,188 @@
+name: "M7A 100 · TUN Proxy Test"
+
+# 目的：验证 TUN 模式代理能否解决「进入游戏」失败。
+#
+# 为什么不继续用 SOCKS5：
+#   失败点固定在点击后 4~5 秒，正好是 WebSocket 建连超时的典型时长。
+#   云游戏用 wss:// 做节点测速，而 SOCKS5 对 WebSocket 升级的支持有坑。
+#   TUN 在网络层接管流量，不依赖 SOCKS5 的 HTTP 升级语义，
+#   并且能一并处理 UDP（WebRTC 串流需要）。
+#
+# 本 workflow 先确认 runner 是否具备 TUN 条件（/dev/net/tun + NET_ADMIN），
+# 再启动 sing-box TUN，校验出口 IP，然后跑完整诊断。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_diag:
+        description: "启动 TUN 后是否继续跑进入游戏的诊断"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  tun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      IMAGE: ghcr.io/moesnow/march7thassistant:latest
+      CNAME: m7a-tun
+      STATE_DIR: /tmp/m7a-state
+      STATE_BRANCH: m7a-state
+      ENC_PATH: m7a_profile.enc
+      LOGIN_TIMEOUT_MIN: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet cryptography requests
+
+      - name: Check TUN capability
+        id: tun
+        run: |
+          set -uo pipefail
+          echo "=== TUN 环境检查 ==="
+          if [ -e /dev/net/tun ]; then echo "  /dev/net/tun 存在"; echo "device=yes" >> "$GITHUB_OUTPUT"; else echo "  /dev/net/tun 不存在"; echo "device=no" >> "$GITHUB_OUTPUT"; fi
+          ls -l /dev/net/tun 2>/dev/null || true
+          echo "  当前用户: $(id -u):$(id -g)"
+          echo "  CapEff: $(grep CapEff /proc/self/status)"
+          if sudo -n true 2>/dev/null; then echo "  有免密 sudo"; else echo "  无免密 sudo"; fi
+          sudo -n modprobe tun 2>/dev/null && echo "  modprobe tun OK" || echo "  modprobe tun 不可用"
+
+      - name: Setup TUN proxy
+        id: tunnel
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.tun.outputs.device }}" != "yes" ]; then
+            echo "::warning::没有 /dev/net/tun，TUN 模式不可行"
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 需要 root 才能建 TUN 与改路由
+          sudo -n env M7A_PROXY_LINK="$M7A_PROXY_LINK" \
+            python3 .github/scripts/setup_tun.py --keep-alive || {
+              echo "::warning::TUN 启动失败"; echo "ok=no" >> "$GITHUB_OUTPUT"; exit 0; }
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
+          echo "=== 经 TUN 的出口 ==="
+          curl -sS --max-time 25 https://api.ipify.org; echo
+
+      - name: Fetch and decrypt profile
+        env:
+          M7A_PROFILE_KEY: ${{ secrets.M7A_PROFILE_KEY }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "$STATE_BRANCH"
+          git show "FETCH_HEAD:$ENC_PATH" > /tmp/m7a_profile.enc
+          python3 .github/scripts/m7a_profile_crypto.py decrypt /tmp/m7a_profile.enc /tmp/state.tar.gz
+          rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
+          tar -xzf /tmp/state.tar.gz -C "$STATE_DIR"
+          chmod -R 0777 "$STATE_DIR" || true
+          mkdir -p "$STATE_DIR/logs"
+          du -sh "$STATE_DIR/UserProfile" 2>/dev/null || true
+
+      - name: "Prepare config (no proxy flag — TUN handles routing)"
+        run: |
+          set -euo pipefail
+          [ -f "$STATE_DIR/config.yaml" ] || cp assets/config/config.example.yaml "$STATE_DIR/config.yaml"
+          python3 - "$STATE_DIR/config.yaml" "$LOGIN_TIMEOUT_MIN" <<'PY'
+          import re, sys
+          path, timeout = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          text = re.sub(r'^cloud_game_login_timeout:.*$',
+                        f'cloud_game_login_timeout: {timeout}', text, count=1, flags=re.M)
+          text = re.sub(r'^after_finish:.*$', 'after_finish: Loop', text, count=1, flags=re.M)
+          # TUN 在网络层接管，容器不需要 --proxy-server
+          text = re.sub(r'^browser_launch_argument:.*$',
+                        'browser_launch_argument: []', text, count=1, flags=re.M)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -E '^(cloud_game_login_timeout|after_finish|browser_launch_argument):' "$STATE_DIR/config.yaml"
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Run diagnostic through TUN
+        if: github.event.inputs.run_diag == 'true' && steps.tunnel.outputs.ok == 'yes'
+        run: |
+          set -uo pipefail
+          docker rm -f "$CNAME" 2>/dev/null || true
+          docker run -d \
+            --name "$CNAME" \
+            --network host \
+            --shm-size=2g \
+            -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
+            -v "$STATE_DIR/logs":/m7a/logs \
+            -v "$STATE_DIR/settings":/m7a/settings \
+            -v "$STATE_DIR/config.yaml":/m7a/config.yaml \
+            -v "${{ github.workspace }}/.github/scripts/diag_deep.py":/m7a/diag_deep.py:ro \
+            -e MARCH7TH_CLOUD_GAME_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_ENABLE=true \
+            -e MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false \
+            -e MARCH7TH_LOG_LEVEL=INFO \
+            "$IMAGE" python diag_deep.py
+          sleep 5
+
+      - name: Collect
+        if: always()
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1500 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            docker logs "$CNAME" > /tmp/tun.log 2>&1 || true
+            if grep -q "诊断完成" /tmp/tun.log 2>/dev/null; then break; fi
+            if ! docker ps --filter "name=$CNAME" --filter "status=running" --format '{{.Names}}' | grep -q "$CNAME"; then
+              echo "容器已退出"; break
+            fi
+            sleep 10
+          done
+          docker logs "$CNAME" > /tmp/tun.log 2>&1 || true
+          echo "=== 结果 ==="
+          grep -E "^>>>|_check_login|找到按钮|\[ ?[0-9]+s\]|✅|通行证" /tmp/tun.log | tail -n 60 || true
+          docker stop "$CNAME" 2>/dev/null || true
+          docker rm "$CNAME" 2>/dev/null || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c 'chmod -R a+rwX /s 2>/dev/null || true' || true
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## 🕳️ TUN 模式代理测试"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| /dev/net/tun | ${{ steps.tun.outputs.device }} |"
+            echo "| TUN 启动 | ${{ steps.tunnel.outputs.ok }} |"
+            echo "| 出口 IP（经 TUN） | $(curl -s --max-time 15 https://api.ipify.org || echo unknown) |"
+            echo
+            echo "### 诊断关键行"
+            echo '```'
+            grep -E "^>>>|_check_login|找到按钮|\[ ?[0-9]+s\]|✅" /tmp/tun.log 2>/dev/null | tail -n 50 || echo "(无)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/singbox/pid ] && sudo kill "$(cat /tmp/singbox/pid)" 2>/dev/null || true
+          echo done
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: tun-test
+          path: |
+            /tmp/tun.log
+            /tmp/singbox/sb.log
+            /tmp/m7a-state/logs/diag2
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
