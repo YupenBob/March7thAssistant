@@ -113,8 +113,19 @@ def install_xray(version="1.8.24"):
     log(f"下载完成 {sz} 字节")
     if sz < 1_000_000:
         raise RuntimeError("下载文件过小，可能失败")
+
     os.makedirs("/tmp/xray", exist_ok=True)
-    subprocess.run(["unzip", "-o", "-q", "/tmp/xray.zip", "-d", "/tmp/xray"], check=True)
+    # 优先用 unzip；runner 上可能没有，则退回 Python 的 zipfile
+    if subprocess.run(["sh", "-c", "command -v unzip"],
+                      capture_output=True).returncode == 0:
+        subprocess.run(["unzip", "-o", "-q", "/tmp/xray.zip", "-d", "/tmp/xray"],
+                       check=True)
+    else:
+        log("未找到 unzip，改用 Python zipfile 解压")
+        import zipfile
+        with zipfile.ZipFile("/tmp/xray.zip") as z:
+            z.extractall("/tmp/xray")
+
     subprocess.run(["chmod", "+x", "/tmp/xray/xray"], check=True)
     out = subprocess.run(["/tmp/xray/xray", "version"],
                          capture_output=True, text=True).stdout
@@ -139,6 +150,9 @@ def main():
         return 2
 
     cfg = build_config(outbound, args.socks_port, args.http_port)
+    # 目录必须先建好 —— 之前写在 install_xray() 里，导致这里写配置就报
+    # FileNotFoundError（实测踩过）。
+    os.makedirs("/tmp/xray", exist_ok=True)
     with open("/tmp/xray/config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     log("配置已写入 /tmp/xray/config.json")
@@ -151,6 +165,8 @@ def main():
         stdout=open("/tmp/xray/xray.log", "w"),
         stderr=subprocess.STDOUT)
     log(f"xray pid={proc.pid}")
+    with open("/tmp/xray/pid", "w") as f:
+        f.write(str(proc.pid))
     time.sleep(5)
 
     if proc.poll() is not None:
@@ -162,24 +178,37 @@ def main():
     import requests
     proxies = {"http": f"http://127.0.0.1:{args.http_port}",
                "https": f"http://127.0.0.1:{args.http_port}"}
+    ok = False
     for url, label in [("https://api.ipify.org", "出口 IP"),
                        ("https://ipinfo.io/json", "归属信息")]:
-        try:
-            r = requests.get(url, proxies=proxies, timeout=25)
-            log(f"{label}: {r.text.strip()[:300]}")
-        except Exception as e:
-            log(f"{label} 查询失败: {type(e).__name__} {e}")
+        for attempt in (1, 2, 3):
+            try:
+                r = requests.get(url, proxies=proxies, timeout=25)
+                log(f"{label}: {r.text.strip()[:300]}")
+                ok = True
+                break
+            except Exception as e:
+                log(f"{label} 第 {attempt} 次失败: {type(e).__name__} {str(e)[:150]}")
+                time.sleep(3)
 
-    # 与直连对比
     try:
         r = requests.get("https://api.ipify.org", timeout=20)
         log(f"直连出口 IP: {r.text.strip()}")
     except Exception as e:
         log(f"直连查询失败: {e}")
 
-    # 杀掉，避免干扰后续
-    proc.terminate()
-    log("xray 已停止")
+    if not ok:
+        log("代理无法访问外网，视为失败")
+        proc.terminate()
+        return 1
+
+    # 保持常驻：后续步骤（含容器）都要用这个代理
+    # --keep-alive 时把进程留下，由 workflow 的清理步骤负责结束
+    if "--keep-alive" in sys.argv:
+        log("代理保持运行中（供后续步骤使用）")
+    else:
+        proc.terminate()
+        log("xray 已停止")
     return 0
 
 

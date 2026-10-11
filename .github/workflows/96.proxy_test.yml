@@ -56,20 +56,14 @@ jobs:
             echo "::error::Secret M7A_PROXY_LINK 未设置"
             exit 1
           fi
-          echo "=== 建立代理并查看出口 ==="
+          echo "=== 建立代理并查看出口（保持常驻）==="
           python3 .github/scripts/setup_proxy.py \
-            --socks-port 10809 --http-port 10810 || {
-              echo "::error::代理建立失败"; exit 1; }
-
-          # xray 是后台启动的，这里重新拉起一个常驻实例供后续步骤使用
-          echo "=== 启动常驻 xray ==="
-          nohup /tmp/xray/xray run -c /tmp/xray/config.json > /tmp/xray/xray-run.log 2>&1 &
-          echo $! > /tmp/xray/pid
-          sleep 5
-          if ! curl -s --max-time 15 -x socks5h://127.0.0.1:10809 https://api.ipify.org; then
-            echo "::error::常驻代理不可用"; cat /tmp/xray/xray-run.log; exit 1
-          fi
+            --socks-port 10809 --http-port 10810 --keep-alive || {
+              echo "::error::代理建立失败（详见上方输出）"; exit 1; }
           echo ""
+          echo "=== 复验代理解析可用 ==="
+          curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org; echo
+          curl -s --max-time 20 -x http://127.0.0.1:10810 https://api.ipify.org; echo
 
       - name: Probe mihoyo endpoints via proxy
         run: |
@@ -235,7 +229,7 @@ jobs:
           name: proxy-test
           path: |
             /tmp/proxy-diag.log
-            /tmp/xray/xray-run.log
+            /tmp/xray/xray.log
             /tmp/m7a-state/logs
           if-no-files-found: warn
           retention-days: 7
