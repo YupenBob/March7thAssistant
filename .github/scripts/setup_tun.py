@@ -51,13 +51,18 @@ def parse_vless_outbound(link: str) -> dict:
     elif security in ("none", ""):
         tls = {"enabled": False}
 
-    transport = {"type": net}
+    # 注意：sing-box 不接受 transport.type = "tcp"（会报
+    # unknown transport type: tcp）。TCP 是默认行为，必须整个省略 transport。
+    # 实测踩过，用 sing-box check 才发现。
+    transport = None
     if net == "ws":
         transport = {"type": "ws", "path": q.get("path", "/")}
         if q.get("host"):
             transport["headers"] = {"Host": q["host"]}
     elif net == "grpc":
         transport = {"type": "grpc", "service_name": q.get("serviceName", "")}
+    elif net == "http":
+        transport = {"type": "http", "host": [q.get("host", "")]}
 
     out = {
         "type": "vless",
@@ -67,8 +72,9 @@ def parse_vless_outbound(link: str) -> dict:
         "uuid": u.username,
         "packet_encoding": "xudp",
         "tls": tls,
-        "transport": transport,
     }
+    if transport is not None:
+        out["transport"] = transport
     if q.get("flow") and security == "reality":
         out["flow"] = q["flow"]
     return out
@@ -103,11 +109,14 @@ def build_config(outbound: dict) -> dict:
         "outbounds": [
             outbound,
             {"type": "direct", "tag": "direct"},
+            {"type": "dns", "tag": "dns-out"},
         ],
         "route": {
+            # 注意：sing-box 1.10.x 的 route.rules 不支持 "action" 字段
+            # （那是 1.11+ 的语法）。1.10 用 protocol/ip_is_private/outbound。
+            # 实测踩过：decode config ... unknown field "action"
             "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
+                {"protocol": "dns", "outbound": "dns-out"},
                 {"ip_is_private": True, "outbound": "direct"},
             ],
             "final": "proxy",
@@ -162,6 +171,19 @@ def main():
     log(f"配置已写入 {WORK}/config.json")
 
     install_singbox()
+
+    # 启动前先用 sing-box 自带的 check 校验配置。
+    # 之前两次 CI 都是因为配置语法错（1.11 的 action 字段、transport tcp）
+    # 而白跑一轮，这里提前拦住。
+    log("=== 校验配置 ===")
+    chk = subprocess.run([f"{WORK}/sing-box", "check", "-c", f"{WORK}/config.json"],
+                         capture_output=True, text=True)
+    if chk.returncode != 0:
+        log("配置非法：")
+        log((chk.stdout or "")[-1500:])
+        log((chk.stderr or "")[-1500:])
+        return 2
+    log("    [ok] 配置合法")
 
     log("=== 启动 sing-box（TUN 模式）===")
     proc = subprocess.Popen([f"{WORK}/sing-box", "run", "-c", f"{WORK}/config.json"],
