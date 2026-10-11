@@ -159,12 +159,30 @@ jobs:
               echo "⏳ **超时未判定**：既没登录也没要求扫码。" >> "$GITHUB_STEP_SUMMARY" ;;
           esac
 
-      - name: Dump log
+      - name: Dump log and relax permissions
         if: always()
         run: |
+          set -uo pipefail
           docker logs "$CNAME" > /tmp/m7a-run.log 2>&1 || true
           docker stop "$CNAME" || true
           docker rm "$CNAME" || true
+
+          # 容器以 root 运行，挂载目录会带 root 属主与 700 权限，
+          # runner 用户随后读不了（实测 tar 只能打出空壳）。
+          # 用一次性容器统一放开权限，与 90 号保持一致。
+          echo "=== 放开权限前 ==="
+          ls -ld "$STATE_DIR" "$STATE_DIR"/UserProfile 2>/dev/null || true
+          docker run --rm -v "$STATE_DIR":/s alpine:3 sh -c \
+            'chmod -R a+rwX /s 2>/dev/null || true; echo done' || true
+          echo "=== 放开权限后 ==="
+          ls -ld "$STATE_DIR" "$STATE_DIR"/UserProfile 2>/dev/null || true
+
+          # 把运行后的 profile 也导出来，便于对比"回灌前后"的差异
+          if [ -d "$STATE_DIR/UserProfile/Integrated" ]; then
+            tar -czf /tmp/profile-after.tar.gz -C "$STATE_DIR/UserProfile" Integrated 2>/dev/null \
+              && ls -lh /tmp/profile-after.tar.gz || echo "::warning::导出 profile 失败"
+          fi
+
           cp /tmp/m7a-run.log m7a-run.log 2>/dev/null || true
 
       - name: Upload run log
@@ -172,6 +190,8 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: m7a-verify-log
-          path: m7a-run.log
+          path: |
+            m7a-run.log
+            /tmp/profile-after.tar.gz
           retention-days: 7
           if-no-files-found: warn
