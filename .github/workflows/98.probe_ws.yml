@@ -1,0 +1,117 @@
+name: "M7A 98 · Probe WS Ping Endpoints"
+
+# 目的：定位「进入云游戏」失败的真正位置。
+#
+# 录屏 + 网络抓包已确认失败点在测速环节：
+#   cg/dispatcher/api/listPingServer  POST 200  拿到节点列表
+#   wss://cg-t-*-wssping.mhystatic.com/wsspingsvr/echo  x5  全部建连失败
+#   cg/dispatcher/api/getNodesInfo    POST 200
+#   -> 弹「网络错误」；真正的 paasDispatch 从未发出
+#
+# 本 workflow 从 runner 侧独立测试这 5 个端点，用于区分：
+#   a) 网络层不通（DNS/TCP/TLS/WSS 任一环节失败）
+#   b) 网络层通，仅 Chrome 内部建连失败（指向代理/WebGL/Chrome 配置）
+#
+# 支持挂代理对比，并额外验证 WebGL 软件回退是否被禁用。
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: "是否先挂代理再测试（对比代理的影响）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      - name: Setup proxy (optional)
+        if: github.event.inputs.use_proxy == 'true'
+        env:
+          M7A_PROXY_LINK: ${{ secrets.M7A_PROXY_LINK }}
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/setup_proxy.py \
+            --socks-port 10809 --http-port 10810 --keep-alive || {
+              echo "::error::代理建立失败"; exit 1; }
+          echo "代理出口: $(curl -s --max-time 20 -x socks5h://127.0.0.1:10809 https://api.ipify.org)"
+
+      - name: Probe WS endpoints (direct)
+        run: |
+          set -uo pipefail
+          echo "=== 直连测试 ==="
+          python3 .github/scripts/probe_ws.py || true
+
+      - name: Probe WS endpoints (via proxy)
+        if: github.event.inputs.use_proxy == 'true'
+        run: |
+          set -uo pipefail
+          echo "=== 经代理测试（env 注入，requests/urllib 会读取）==="
+          export ALL_PROXY="socks5h://127.0.0.1:10809"
+          export HTTP_PROXY="http://127.0.0.1:10810"
+          export HTTPS_PROXY="http://127.0.0.1:10810"
+          # probe_ws 用的是裸 socket，不受代理影响；这里额外用 curl 验证代理侧
+          for h in cg-t-tybj2-wssping.mhystatic.com cg-t-ensfz6-wssping.mhystatic.com; do
+            echo "--- $h ---"
+            curl -s -o /dev/null -w "  直连 TCP: %{http_code}  time=%{time_total}s\n" \
+              --max-time 15 "https://$h/" 2>&1 || echo "  直连失败"
+            curl -s -o /dev/null -w "  代理 TCP: %{http_code}  time=%{time_total}s\n" \
+              -x socks5h://127.0.0.1:10809 --max-time 15 "https://$h/" 2>&1 || echo "  代理失败"
+          done
+
+      - name: Check WebGL capability in headless Chrome
+        run: |
+          set -uo pipefail
+          echo "=== 用与正式运行相同的镜像检查 headless Chrome 的 WebGL ==="
+          docker run --rm --shm-size=1g \
+            ghcr.io/moesnow/march7thassistant:latest \
+            sh -c '
+              CHROME=$(ls -d /m7a/3rdparty/WebBrowser/chrome/linux64/*/chrome 2>/dev/null | head -n 1)
+              echo "chrome: $CHROME"
+              if [ -z "$CHROME" ]; then echo "找不到 chrome"; exit 0; fi
+              echo "--- 默认参数 ---"
+              timeout 40 "$CHROME" --headless=new --disable-gpu --no-sandbox \
+                --dump-dom about:blank >/dev/null 2>/tmp/c1.log || true
+              grep -iE "webgl|swiftshader|gpu" /tmp/c1.log | head -n 10 || echo "(无相关输出)"
+              echo "--- 加 --enable-unsafe-swiftshader ---"
+              timeout 40 "$CHROME" --headless=new --disable-gpu --no-sandbox \
+                --enable-unsafe-swiftshader \
+                --dump-dom about:blank >/dev/null 2>/tmp/c2.log || true
+              grep -iE "webgl|swiftshader|gpu" /tmp/c2.log | head -n 10 || echo "(无相关输出)"
+            ' || echo "容器执行失败"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 🔌 测速端点与 WebGL 探测"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 出口 IP | $(curl -s --max-time 10 https://api.ipify.org || echo unknown) |"
+            echo "| 代理 | ${{ github.event.inputs.use_proxy }} |"
+            echo "| 时间 | $(date -u +%FT%TZ) |"
+            echo
+            echo "要点：若 5 个端点 TCP/WSS 均通，但 Chrome 内仍报"
+            echo "\"WebSocket is closed before the connection is established\"，"
+            echo "则问题在 Chrome 侧（代理配置 / WebGL 回退被禁 / 连接被打断），"
+            echo "而非网络不可达。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          [ -f /tmp/xray/pid ] && kill "$(cat /tmp/xray/pid)" 2>/dev/null || true
+          echo done
