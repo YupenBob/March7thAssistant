@@ -137,6 +137,8 @@ def main():
     ap.add_argument("--link", default=os.environ.get("M7A_PROXY_LINK", ""))
     ap.add_argument("--socks-port", type=int, default=10809)
     ap.add_argument("--http-port", type=int, default=10810)
+    ap.add_argument("--keep-alive", action="store_true",
+                    help="保持代理进程运行，供后续步骤（含容器）使用")
     args = ap.parse_args()
 
     if not args.link:
