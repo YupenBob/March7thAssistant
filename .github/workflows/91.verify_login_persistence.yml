@@ -1,4 +1,4 @@
-﻿name: "M7A 91 · Verify Login Persistence"
+name: "M7A 91 · Verify Login Persistence"
 
 # 目的：回答整个方案的生死问题
 #   Q: 把上一次抓到的登录态塞回去，能不能【不用扫码】直接进游戏？
@@ -91,6 +91,7 @@ jobs:
           # 关键：不设置任何交互可能。若登录态无效，程序会自行走二维码流程，
           # 那正是我们要观测的"失败信号"。
           docker run -d \
+            --user "$(id -u):$(id -g)" \
             --name "$CNAME" \
             --shm-size=2g \
             -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \

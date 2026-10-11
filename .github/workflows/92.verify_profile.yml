@@ -116,6 +116,7 @@ jobs:
           set -euo pipefail
           docker rm -f "$CNAME" 2>/dev/null || true
           docker run -d \
+            --user "$(id -u):$(id -g)" \
             --name "$CNAME" \
             --shm-size=2g \
             -v "$STATE_DIR/UserProfile":/m7a/3rdparty/WebBrowser/UserProfile \
