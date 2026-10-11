@@ -19,7 +19,8 @@ on:
         default: "3"
 
 permissions:
-  contents: read
+  # 需要 write 才能把最新二维码推到 m7a-qr 分支，供用户实时获取
+  contents: write
 
 jobs:
   capture:
@@ -224,6 +225,19 @@ jobs:
             && echo "二维码图片已从容器取出" \
             || echo "::warning::容器内没找到 qrcode_login.png"
 
+      - name: Publish QR link to branch (for instant access)
+        if: always()
+        run: |
+          set -uo pipefail
+          LINK="$(grep -oE 'https://user\.mihoyo\.com/login-platform/[^[:space:]]+' /tmp/m7a.log 2>/dev/null | tail -n 1)"
+          if [ -z "$LINK" ]; then
+            echo "::warning::还没解出二维码链接，稍后由 Wait for scan 步骤发布"
+            exit 0
+          fi
+          echo "发布: $LINK"
+          bash .github/scripts/publish_qr.sh "$LINK" /tmp/qrcode_login.png || \
+            echo "::warning::发布失败（分支权限？）"
+
       - name: Upload QR image immediately
         if: always()
         uses: actions/upload-artifact@v5
@@ -269,6 +283,11 @@ jobs:
               } >> "$GITHUB_STEP_SUMMARY"
               echo "--- 新二维码 $(date -u +%H:%M:%SZ) ---"
               echo "$cur"
+              # 同步推到 m7a-qr 分支，用户可用固定 URL 实时获取最新链接
+              docker cp "$CNAME:/m7a/logs/qrcode_login.png" /tmp/qrcode_login.png 2>/dev/null || true
+              bash .github/scripts/publish_qr.sh "$cur" /tmp/qrcode_login.png >/dev/null 2>&1 \
+                && echo "    已发布到 m7a-qr 分支" \
+                || echo "::warning::二维码发布到分支失败"
             fi
 
             # 3) 程序侧登录超时不再终止等待 —— after_finish=Loop 会让它进入下一轮，
